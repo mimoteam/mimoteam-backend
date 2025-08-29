@@ -1,0 +1,18 @@
+# cria/atualiza .gitignore
+cat >> .gitignore << 'EOF'
+# deps & build
+node_modules/
+dist/
+build/
+
+# env
+.env
+.env.*
+!.env.example
+
+# uploads (arquivos gerados em runtime)
+uploads/
+
+# logs/OS/IDE
+*.log
+.DS_Store
