@@ -1,45 +1,51 @@
 // scripts/upsert-admin.ts
 import 'dotenv/config';
 import mongoose from 'mongoose';
-
-// 👉 seu model fica em src/users/user.model.ts
-// na maioria dos projetos Mongoose com TS, ele exporta "default"
+import bcrypt from 'bcryptjs';
 import UserModel from '../src/users/user.model';
-// Se der erro "does not have a default export", troque a linha acima por:
-// import { default as UserModel } from '../src/users/user.model';
 
 async function main() {
-  const uri = process.env.MONGO_URI;
-  if (!uri) throw new Error('MONGO_URI ausente no .env');
+  const MONGO_URI = process.env.MONGO_URI!;
+  if (!MONGO_URI) throw new Error('MONGO_URI não definido');
 
-  await mongoose.connect(uri);
+  const login  = process.env.ADMIN_LOGIN  || 'admin';
+  const email  = process.env.ADMIN_EMAIL  || 'admin@mimo.local';
+  const pwdRaw = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS || 'changeme';
+  const fullName = process.env.ADMIN_NAME || 'Admin User';
 
-  const email = process.env.ADMIN_EMAIL ?? 'admin@mimo.local';
-  const login = process.env.ADMIN_LOGIN ?? 'admin';
-  const pass  = process.env.ADMIN_PASS  ?? 'Admin123456';
-  const name  = process.env.ADMIN_NAME  ?? 'Admin Local';
+  await mongoose.connect(MONGO_URI);
 
-  // Usa o hook pre('findOneAndUpdate') para hashear senha quando não começa com $2
-  const user = await (UserModel as any).findOneAndUpdate(
-    { login },
-    {
-      $set: {
-        fullName: name,
-        email,
-        login,
-        role: 'admin',
-        status: 'active',
-        password: pass, // será hasheada pelo hook
-      },
-    },
-    { new: true, upsert: true, runValidators: true }
-  );
+  const hash = await bcrypt.hash(pwdRaw, 10);
 
-  console.log('✅ Admin upserted:', { id: user?._id?.toString(), email: user?.email, login });
+  const existing = await UserModel.findOne({ $or: [{ login }, { email }] }).select('_id').lean();
+
+  if (existing) {
+    await UserModel.updateOne(
+      { _id: existing._id },
+      { $set: { fullName, login, email, password: hash, role: 'admin', status: 'active' } }
+    );
+  } else {
+    await UserModel.create({
+      fullName,
+      login,
+      email,
+      password: hash,
+      role: 'admin',
+      status: 'active',
+    });
+  }
+
+  // Busca id para log
+  const saved = await UserModel.findOne({ login }).select('_id').lean();
+
+  console.log('✅ Admin upserted:', {
+    id: saved?._id?.toString(),
+    login,
+    email,
+    password: pwdRaw, // mostrado só aqui no script para facilitar o teste
+  });
+
   await mongoose.disconnect();
 }
 
-main().catch((e) => {
-  console.error('❌ Falhou:', e);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });

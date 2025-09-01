@@ -1,4 +1,3 @@
-// backend/src/services/service.routes.ts
 import { Router } from "express";
 import { type SortOrder } from "mongoose";
 import { Service } from "./service.model";
@@ -120,21 +119,56 @@ const parsePayload = (b: any) => ({
   status: typeof b.status === "string" ? b.status : "RECORDED",
 });
 
+/** Aceita ids em: ?ids=a,b,c  ou  ?ids[]=a&ids[]=b */
+const parseIdsQuery = (q: any): string[] => {
+  const rawAny = ((): any => {
+    if (q.ids != null) return q.ids;           // ids=a,b,c  ou  ids=[...]
+    if (q["ids[]"] != null) return q["ids[]"]; // ids[]=a&ids[]=b
+    return undefined;
+  })();
+
+  const list = Array.isArray(rawAny)
+    ? rawAny
+    : String(rawAny || "").split(",");
+
+  return list
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+    .filter((s) => /^[0-9a-fA-F]{24}$/.test(s));
+};
+
+
 /* ---------------- rotas ---------------- */
 
 // GET /services
 servicesRouter.get("/", async (req, res, next) => {
   try {
+    const ids = parseIdsQuery(req.query);
+    const baseFilter = buildFilter(req.query);
+    const sort = buildSort(req.query);
+
+    // Quando ids são passados, retornamos todos os correspondentes (sem paginação)
+    if (ids.length > 0) {
+      const filter = { ...baseFilter, _id: { $in: ids } };
+      const docs = await Service.find(filter).sort(sort).lean();
+      const items = (docs as any[]).map(normalizeOut);
+      return res.json({
+        items,
+        total: items.length,
+        page: 1,
+        pageSize: items.length || 1,
+        totalPages: 1,
+      });
+    }
+
+    // Lista paginada normal
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.max(1, Math.min(500, Number(req.query.pageSize || 20)));
     const skip = (page - 1) * pageSize;
 
-    const filter = buildFilter(req.query);
-    const sort = buildSort(req.query);
-
     const [docs, total] = await Promise.all([
-      Service.find(filter).sort(sort).skip(skip).limit(pageSize).lean(),
-      Service.countDocuments(filter),
+      Service.find(baseFilter).sort(sort).skip(skip).limit(pageSize).lean(),
+      Service.countDocuments(baseFilter),
     ]);
 
     const items = (docs as any[]).map(normalizeOut);
