@@ -4,8 +4,11 @@ import cors, { type CorsOptions } from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import cookieParser from "cookie-parser";
+import compression from "compression";
+import responseTime from "response-time";
+import path from "path";
 
-import userRoutes from "./users/user.routes";            // ✔ default export
+import userRoutes from "./users/user.routes";
 import authRoutes from "./auth/auth.routes";
 import { servicesRouter } from "./services/service.routes";
 import costRoutes from "./costs/cost.routes";
@@ -15,6 +18,10 @@ import { ensureUploadDirs, ROOT_UPLOADS } from "./config/uploads";
 import uploadRoutes from "./upload/upload.routes";
 
 const app = express();
+
+/* Ajustes gerais que ajudam em prod */
+app.set("etag", "strong");       // ETag forte em JSON
+app.set("trust proxy", 1);       // Render/Proxies
 
 /* CORS */
 const envOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
@@ -33,24 +40,32 @@ const corsOptions: CorsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   optionsSuccessStatus: 204,
+  maxAge: 600, // 🔥 cacheia preflight por 10 min
 };
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 
 /* Middlewares */
 app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(compression());                 // 🔥 gzip/br
+app.use(responseTime());                // X-Response-Time
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-app.use(morgan("dev"));
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-/* Uploads estático */
+/* Uploads estático com cache */
 ensureUploadDirs();
-app.use("/uploads", express.static(ROOT_UPLOADS));
+app.use("/uploads", express.static(path.resolve(ROOT_UPLOADS), {
+  etag: true,
+  lastModified: true,
+  maxAge: "7d", // 🔥 cache de 7 dias em assets
+  immutable: false,
+}));
 
-/* Rotas (ordem importa: antes do 404) */
+/* Rotas */
 app.use("/auth", authRoutes);
-app.use("/users", userRoutes);                              // ✔ aqui é userRoutes
+app.use("/users", userRoutes);
 app.use("/services", servicesRouter);
 app.use("/costs", costRoutes);
 app.use("/payments", paymentRoutes);
