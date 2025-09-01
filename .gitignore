@@ -16,3 +16,6 @@ uploads/
 # logs/OS/IDE
 *.log
 .DS_Store
+
+.env*
+
