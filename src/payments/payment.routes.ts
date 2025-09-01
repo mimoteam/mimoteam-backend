@@ -1,5 +1,7 @@
 // backend/src/payments/payment.routes.ts
 import { Router } from 'express';
+import crypto from 'crypto';
+import mongoose from 'mongoose';
 import Payment from './payment.model';
 import { Service } from '../services/service.model';
 
@@ -13,6 +15,9 @@ const normalizePayment = (d: any) => {
     serviceIds: Array.isArray(serviceIds) ? serviceIds.map((x: any) => String(x)) : [],
   };
 };
+
+const newNoteId = () =>
+  (crypto as any)?.randomUUID?.() || new mongoose.Types.ObjectId().toString();
 
 async function recalcTotal(paymentId: string) {
   const p = await Payment.findById(paymentId).lean();
@@ -83,14 +88,27 @@ router.post('/', async (req, res) => {
   res.status(201).json(normalizePayment(obj));
 });
 
-// UPDATE
+// UPDATE (com append de nota em notesLog quando vier appendNote + notes)
 router.patch('/:id', async (req, res) => {
   const { id } = req.params;
-  const patch: any = { ...req.body };
+  const body = req.body || {};
+  const { appendNote, notes, ...patch } = body;
+
+  // normalizações
   if (Array.isArray(patch.serviceIds)) patch.serviceIds = patch.serviceIds.map(String);
   if (Array.isArray(patch.extraIds)) patch.extraIds = patch.extraIds.map(String);
 
-  const updated = await Payment.findByIdAndUpdate(id, { $set: patch }, { new: true }).lean();
+  // monta update atômico ($set + $push opcional)
+  const update: any = { $set: patch };
+
+  if (appendNote && typeof notes === 'string' && notes.trim()) {
+    const note = { id: newNoteId(), text: notes.trim(), at: new Date() };
+    update.$push = { notesLog: note };
+    // manter último texto em `notes` como referência rápida (opcional)
+    if (!('notes' in patch)) update.$set.notes = notes.trim();
+  }
+
+  const updated = await Payment.findByIdAndUpdate(id, update, { new: true }).lean();
   if (!updated) return res.status(404).json({ error: 'Not found' });
 
   // se mexeu em serviceIds, recalcular total

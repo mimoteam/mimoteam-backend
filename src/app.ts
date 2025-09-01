@@ -18,6 +18,7 @@ import { ensureUploadDirs, ROOT_UPLOADS } from "./config/uploads";
 import uploadRoutes from "./upload/upload.routes";
 import taskRoutes from "./tasks/task.routes";
 import handoverRoutes from "./handover/handover.routes";
+import statusRoutes from "./status/status.routes";
 
 // ⬇️ use o shim que exporta `auth` (se preferir, troque para o seu middleware real)
 import { auth } from "./middleware/auth";
@@ -91,6 +92,7 @@ app.use("/costs", costRoutes);
 app.use("/payments", paymentRoutes);
 app.use("/availability", availabilityRoutes);
 app.use("/upload", uploadRoutes);
+app.use(statusRoutes);
 
 /* Rotas que exigem admin */
 app.use("/tasks", auth("admin"), taskRoutes);
