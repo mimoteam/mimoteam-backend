@@ -1,127 +1,70 @@
-// src/tasks/task.routes.ts
-import { Router, type Request, type Response } from "express";
-import TaskModel from "./task.model";
-import { CreateTaskSchema, UpdateTaskSchema, ListTasksQuerySchema } from "./task.schemas";
+import { Router } from "express";
+import { Task } from "./task.model";
 import { z } from "zod";
+import { ListTaskQuerySchema, CreateTaskSchema, PatchTaskSchema } from "./task.schemas";
 
 const router = Router();
 
-// projeção base
-const BASE_PROJECTION = { __v: 0 } as const;
-
-function actor(req: Request) {
-  const any = req as any;
-  const u = any.user || any.auth || {};
-  return {
-    id: u.id || u._id || u.userId || null,
-    name: u.fullName || u.name || u.login || u.email || "Admin",
-    role: u.role || "admin",
-  };
-}
-
-const IdParam = z.object({ id: z.string().length(24) });
-
-router.get("/", async (req: Request, res: Response) => {
+// GET /tasks
+router.get("/", async (req, res, next) => {
   try {
-    const parsed = ListTasksQuerySchema.safeParse(req.query);
-    if (!parsed.success) return res.status(400).json({ error: "invalid query" });
-
-    const { q, completed, assignedToId, page, pageSize, includeTotal } = parsed.data;
-
+    const q = ListTaskQuerySchema.parse(req.query);
     const filter: any = {};
-    if (typeof completed === "boolean") filter.completed = completed;
-    if (assignedToId) filter.assignedToId = assignedToId;
+    if (q.q) filter.text = { $regex: q.q, $options: "i" };
+    if (typeof q.completed === "boolean") filter.completed = q.completed;
+    if (q.status) filter.status = q.status;
+    if (q.assignedToId) filter.assignedToId = q.assignedToId;
 
-    let useText = false;
-    if (q && q.trim().length >= 2) {
-      filter.$text = { $search: q.trim() };
-      useText = true;
-    } else if (q) {
-      const rx = new RegExp(q, "i");
-      filter.text = rx;
-    }
+    const skip = (q.page - 1) * q.pageSize;
+    const cursor = Task.find(filter).sort({ updatedAt: -1, createdAt: -1 }).skip(skip).limit(q.pageSize);
+    const [items, total] = await Promise.all([
+      cursor.lean(),
+      q.includeTotal ? Task.countDocuments(filter) : Promise.resolve(0),
+    ]);
 
-    const skip = (page - 1) * pageSize;
-    const sort: any = useText ? { score: { $meta: "textScore" }, createdAt: -1 } : { createdAt: -1 };
-    const projection: any = useText ? { ...BASE_PROJECTION, score: { $meta: "textScore" } } : BASE_PROJECTION;
-
-    let qy = TaskModel.find(filter).select(projection).sort(sort).skip(skip).limit(pageSize).lean();
-    if (!useText && typeof completed === "boolean") qy = qy.hint({ completed: 1, createdAt: -1 });
-    if (!useText && !assignedToId && typeof completed !== "boolean" && !q) qy = qy.hint({ createdAt: -1 });
-
-    const listPromise = qy.exec();
-    const countPromise = includeTotal
-      ? (q || typeof completed === "boolean" || assignedToId
-          ? TaskModel.countDocuments(filter).exec()
-          : TaskModel.estimatedDocumentCount().exec())
-      : Promise.resolve(undefined);
-
-    const [items, total] = await Promise.all([listPromise, countPromise]);
-    const clean = items.map(({ score, ...rest }: any) => rest);
-
-    const payload: any = { items: clean, page, pageSize };
-    if (includeTotal) payload.total = total;
-
-    res.json(payload);
-  } catch (e) {
-    console.error("[tasks:list] error:", e);
-    res.status(500).json({ error: "internal error" });
-  }
+    res.json({ items, page: q.page, pageSize: q.pageSize, total });
+  } catch (err) { next(err); }
 });
 
-router.post("/", async (req: Request, res: Response) => {
+// POST /tasks
+router.post("/", async (req, res, next) => {
   try {
-    const parsed = CreateTaskSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: "invalid body" });
-
-    const a = actor(req);
-    const doc = await TaskModel.create({
-      ...parsed.data,
-      createdById: a.id,
-      createdByName: a.name,
+    const body = CreateTaskSchema.parse(req.body);
+    const created = await Task.create({
+      ...body,
+      status: "todo",
+      completed: false,
+      createdBy: req.user?._id ?? null,
+      createdByName: req.user?.fullName || req.user?.name || req.user?.email || "Admin",
     });
-
-    res.status(201).json(doc.toObject());
-  } catch (e) {
-    console.error("[tasks:create] error:", e);
-    res.status(500).json({ error: "internal error" });
-  }
+    res.status(201).json(created);
+  } catch (err) { next(err); }
 });
 
-router.patch("/:id", async (req: Request, res: Response) => {
+// PATCH /tasks/:id
+router.patch("/:id", async (req, res, next) => {
   try {
-    const pid = IdParam.safeParse(req.params);
-    if (!pid.success) return res.status(400).json({ error: "invalid id" });
+    const id = String(req.params.id);
+    const patch = PatchTaskSchema.parse(req.body);
 
-    const parsed = UpdateTaskSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: "invalid body" });
+    // coerência completed ↔ status
+    if (patch.completed === true && !patch.status) patch.status = "done";
+    if (patch.status === "done" && patch.completed !== true) patch.completed = true;
 
-    const updated = await TaskModel.findByIdAndUpdate(pid.data.id, parsed.data, {
-      new: true,
-      runValidators: true,
-      projection: BASE_PROJECTION,
-    }).lean();
-
-    if (!updated) return res.status(404).json({ error: "not found" });
+    const updated = await Task.findByIdAndUpdate(id, patch, { new: true, runValidators: true }).lean();
+    if (!updated) return res.status(404).json({ message: "Task not found" });
     res.json(updated);
-  } catch (e) {
-    console.error("[tasks:update] error:", e);
-    res.status(500).json({ error: "internal error" });
-  }
+  } catch (err) { next(err); }
 });
 
-router.delete("/:id", async (req: Request, res: Response) => {
+// DELETE /tasks/:id
+router.delete("/:id", async (req, res, next) => {
   try {
-    const pid = IdParam.safeParse(req.params);
-    if (!pid.success) return res.status(400).json({ error: "invalid id" });
-
-    const deleted = await TaskModel.findByIdAndDelete(pid.data.id).select("_id").lean();
-    if (!deleted) return res.status(404).json({ error: "not found" });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[tasks:delete] error:", e);
-    res.status(500).json({ error: "internal error" });
-  }
+    const id = String(req.params.id);
+    const ok = await Task.findByIdAndDelete(id);
+    if (!ok) return res.status(404).json({ message: "Task not found" });
+    res.status(204).end();
+  } catch (err) { next(err); }
 });
 
 export default router;

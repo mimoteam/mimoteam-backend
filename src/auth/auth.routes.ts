@@ -4,11 +4,13 @@ import * as jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import User from "../users/user.model";
+import { auth } from "../middleware/auth";
+import { env } from "../config/env";
 
 const router = Router();
 
 /* ===== JWT ===== */
-const JWT_SECRET: jwt.Secret = (process.env.JWT_SECRET ?? "dev-secret");
+const JWT_SECRET: jwt.Secret = env.JWT_SECRET;
 const JWT_EXPIRES_IN: jwt.SignOptions["expiresIn"] = (() => {
   const v = process.env.JWT_EXPIRES_IN;
   if (!v) return "7d";
@@ -16,13 +18,14 @@ const JWT_EXPIRES_IN: jwt.SignOptions["expiresIn"] = (() => {
   return v as jwt.SignOptions["expiresIn"];
 })();
 
-/* ===== Utils ===== */
+/* ===== Helpers ===== */
 const norm = (s?: string) => (s || "").toString().trim().toLowerCase();
 const isObjectId = (id?: string) =>
   typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
 
 const sanitize = (u: any) => {
-  const obj = u?.toObject ? u.toObject() : u;
+  if (!u) return null;
+  const obj = u.toObject ? u.toObject({ virtuals: true }) : u;
   const { password, __v, ...rest } = obj || {};
   return rest;
 };
@@ -32,7 +35,7 @@ async function matches(input: string, stored?: string | null) {
   if (/^\$2[aby]\$/.test(stored)) {
     try { return await bcrypt.compare(input, stored); } catch { return false; }
   }
-  return input === stored; // legado (texto puro)
+  return input === stored; // legado
 }
 
 function readPw(body: any = {}) {
@@ -41,24 +44,6 @@ function readPw(body: any = {}) {
   const next =
     body.newPassword ?? body.passwordNew ?? body.nextPassword ?? body.new ?? body.newpass;
   return { current: String(current ?? ""), next: String(next ?? "") };
-}
-
-function tokenFromReq(req: Request): string | null {
-  const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-  const cookieTok = (req as any).cookies?.token as string | undefined;
-  return bearer || cookieTok || null;
-}
-
-function userIdFromReq(req: Request): string | null {
-  const tok = tokenFromReq(req);
-  if (!tok) return null;
-  try {
-    const payload = jwt.verify(tok, JWT_SECRET) as jwt.JwtPayload | string;
-    const id = typeof payload === "string" ? "" : String(payload?.sub ?? (payload as any)?.id ?? "");
-    return isObjectId(id) ? id : null;
-  } catch {
-    return null;
-  }
 }
 
 /* ---------- POST /auth/login ---------- */
@@ -71,14 +56,12 @@ router.post("/login", async (req: Request, res: Response, next: NextFunction) =>
       return res.status(400).json({ message: "login/email and password are required" });
     }
 
-    // precisa do DOC real e com password selecionado
     const userDoc = await User.findOne({
       $or: [
         { login: new RegExp(`^${userKey}$`, "i") },
         { email: new RegExp(`^${userKey}$`, "i") },
       ],
-    })
-      .select("+password"); // <-- ESSENCIAL
+    }).select("+password"); // precisamos do hash
 
     if (!userDoc) return res.status(401).json({ message: "Invalid credentials" });
 
@@ -97,13 +80,19 @@ router.post("/login", async (req: Request, res: Response, next: NextFunction) =>
 
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
-    const token = jwt.sign(
-      { sub: String(userDoc._id), id: String(userDoc._id), role: userDoc.role || "partner" },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRES_IN }
-    );
+    const payload = {
+      _id: String(userDoc._id),
+      id: String(userDoc._id),
+      email: userDoc.email,
+      fullName: (userDoc as any).fullName || "",
+      role: userDoc.role || "partner",
+    };
 
-    // cookie opcional como fallback
+    const token = jwt.sign(payload, JWT_SECRET, {
+      expiresIn: JWT_EXPIRES_IN,
+      algorithm: "HS256",
+    });
+
     res.cookie?.("token", token, {
       httpOnly: true,
       sameSite: "lax",
@@ -118,30 +107,29 @@ router.post("/login", async (req: Request, res: Response, next: NextFunction) =>
 });
 
 /* ---------- GET /auth/me ---------- */
-router.get("/me", async (req: Request, res: Response) => {
+router.get("/me", auth(), async (req: Request, res: Response) => {
   try {
-    const tok = tokenFromReq(req);
-    if (!tok) return res.status(401).json({ message: "Missing token" });
+    const id = (req.user as any)?._id || (req.user as any)?.id;
+    if (!id || !isObjectId(id)) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-    const payload = jwt.verify(tok, JWT_SECRET) as jwt.JwtPayload | string;
-    const id = typeof payload === "string" ? "" : String(payload?.sub || (payload as any)?.id || "");
-    if (!isObjectId(id)) return res.status(401).json({ message: "Invalid token payload" });
+    // Busca documento completo com virtuals (*YMD)
+    const fresh = await User.findById(id).select("+_id");
+    if (!fresh) return res.status(404).json({ message: "User not found" });
 
-    const user = await User.findById(id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    res.json({ user: sanitize(user) });
-  } catch {
-    res.status(401).json({ message: "Invalid token" });
+    return res.json({ ok: true, user: sanitize(fresh) });
+  } catch (err) {
+    console.error("auth.me error:", err);
+    return res.status(500).json({ message: "Internal error" });
   }
 });
 
 /* ---------- POST /auth/change-password ---------- */
-router.post("/change-password", async (req: Request, res: Response, next: NextFunction) => {
+router.post("/change-password", auth(), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const bearerId = userIdFromReq(req);
-    const explicitId = (req.body?.userId || req.body?.id) as string | undefined;
-    const userId = bearerId || (isObjectId(explicitId) ? explicitId : null);
+    const me = req.user;
+    const userId = (me as any)?._id && isObjectId((me as any)._id) ? String((me as any)._id) : null;
     if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
     const { current, next } = readPw(req.body);

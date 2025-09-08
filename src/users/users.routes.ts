@@ -1,6 +1,6 @@
-// src/users/user.routes.ts
+// src/users/users.routes.ts
 import { Router, type Request, type Response, type NextFunction } from "express";
-import mongoose from "mongoose";
+import mongoose, { type SortOrder } from "mongoose";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import User from "./user.model";
@@ -9,28 +9,24 @@ import { uploadAvatarMulter } from "../middleware/uploadAvatar";
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 
-/* ========= Utils ========= */
+/* ========= Utils (somente UMA vez) ========= */
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const isObjectId = (id?: string) =>
-  typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
-
+const equalsCi = (v: string) => new RegExp(`^${escapeRegExp(String(v))}$`, "i");
 const toInt = (v: unknown, def: number) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 };
+const isObjectId = (id?: string) =>
+  typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
 
-/** Normaliza payload de datas para compat com o frontend (FinanceProfile) */
+/** Normaliza payload de datas p/ compat */
 function normalizePatch(body: any = {}) {
   const patch: any = { ...body };
-
-  // DOB
   if (body.dob !== undefined || body.birthday !== undefined) {
     const v = body.dob ?? body.birthday ?? "";
     patch.birthday = v === "" ? null : v;
     delete patch.dob;
   }
-
-  // Start/Hire Date
   if (
     body.hireDate !== undefined ||
     body.startDate !== undefined ||
@@ -42,11 +38,8 @@ function normalizePatch(body: any = {}) {
     patch.startDate = val;
     patch.companyStartDate = val;
   }
-
-  // nunca permita trocar _id via update
   delete patch._id;
   delete patch.id;
-
   return patch;
 }
 
@@ -68,6 +61,7 @@ function readPw(body: any = {}) {
 
   return { current: String(current ?? ""), next: String(next ?? "") };
 }
+
 function getUserIdFromReq(req: Request): string | null {
   const auth = String(req.headers.authorization || "");
   const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -99,46 +93,54 @@ router.get(
   "/",
   async (
     req: Request<unknown, unknown, unknown, ListQuery>,
-    res: Response,
-    next: NextFunction
+    res: Response
   ) => {
-    try {
-      const { role, status, page, pageSize, limit, offset, q } = req.query;
+    const { role, status, page, pageSize, limit, offset, q } = req.query;
 
-      const pageNum = toInt(
-        page ?? (offset ? Math.floor(toInt(offset, 0) / toInt(limit ?? 10, 10)) + 1 : 1),
-        1
-      );
-      const pageSizeNum = toInt(pageSize ?? limit ?? 10, 10);
-      const skip = (pageNum - 1) * pageSizeNum;
+    const pageNum = toInt(
+      page ?? (offset ? Math.floor(toInt(offset, 0) / toInt(limit ?? 10, 10)) + 1 : 1),
+      1
+    );
+    const pageSizeNum = Math.max(1, Math.min(1000, toInt(pageSize ?? limit ?? 10, 10)));
+    const skip = (pageNum - 1) * pageSizeNum;
 
-      const filter: any = {};
-      if (role) {
-        filter.role = { $regex: new RegExp(`^${escapeRegExp(String(role))}$`, "i") };
-      }
-      if (status) {
-        filter.status = { $regex: new RegExp(`^${escapeRegExp(String(status))}$`, "i") };
-      }
-      if (q) {
-        const rx = new RegExp(String(q), "i");
-        filter.$or = [{ fullName: rx }, { login: rx }, { email: rx }];
-      }
+    const filter: any = {};
 
-      const [items, total] = await Promise.all([
-        User.find(filter).skip(skip).limit(pageSizeNum).lean(),
-        User.countDocuments(filter),
-      ]);
-
-      res.json({
-        items,
-        total,
-        page: pageNum,
-        pageSize: pageSizeNum,
-        totalPages: Math.max(1, Math.ceil(total / pageSizeNum)),
-      });
-    } catch (err) {
-      next(err);
+    if (role) {
+      filter.$or = [
+        { role: equalsCi(String(role)) },
+        { roles: equalsCi(String(role)) },
+      ];
     }
+
+    if (status) {
+      const s = String(status).toLowerCase();
+      if (s === "active" || s === "inactive") {
+        filter.isActive = s === "active";
+      } else {
+        filter.status = equalsCi(String(status));
+      }
+    }
+
+    if (q) {
+      const rx = new RegExp(escapeRegExp(String(q)), "i");
+      filter.$or = [...(filter.$or ?? []), { fullName: rx }, { login: rx }, { email: rx }];
+    }
+
+    const sort: Record<string, SortOrder> = { fullName: 1 };
+
+    const [items, total] = await Promise.all([
+      User.find(filter).sort(sort).skip(skip).limit(pageSizeNum).lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({
+      items,
+      total,
+      page: pageNum,
+      pageSize: pageSizeNum,
+      totalPages: Math.max(1, Math.ceil(total / pageSizeNum)),
+    });
   }
 );
 
@@ -155,10 +157,8 @@ router.post("/", async (req: Request, res: Response, next: NextFunction) => {
 });
 
 /* =========================
-   UPDATEs (corrigem os 404)
+   UPDATEs
    ========================= */
-
-// PATCH/PUT/POST (legado) /users/:id
 async function updateById(req: Request, res: Response, next: NextFunction) {
   try {
     const { id } = req.params as { id: string };
@@ -168,7 +168,6 @@ async function updateById(req: Request, res: Response, next: NextFunction) {
     const updated = await User.findByIdAndUpdate(id, { $set: patch }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: "Not found" });
 
-    // retorna objeto plano (frontend faz merge direto)
     return res.json(updated);
   } catch (err) {
     next(err);
@@ -176,10 +175,8 @@ async function updateById(req: Request, res: Response, next: NextFunction) {
 }
 router.patch("/:id", updateById);
 router.put("/:id", updateById);
-// alguns clientes antigos usam POST para update
 router.post("/:id", updateById);
 
-// PATCH/PUT /users  (id no body)
 async function updateCollection(req: Request, res: Response, next: NextFunction) {
   try {
     const id = (req.body?._id || req.body?.id) as string | undefined;
@@ -197,10 +194,8 @@ async function updateCollection(req: Request, res: Response, next: NextFunction)
 router.patch("/", updateCollection);
 router.put("/", updateCollection);
 
-// PATCH/PUT /users/me (quando o cliente atualiza o próprio registro)
 async function updateMe(req: Request, res: Response, next: NextFunction) {
   try {
-    // sem middleware de auth, tentamos header/cookie/req.user
     const uid =
       (req as any).user?._id ||
       (req as any).user?.id ||
@@ -224,9 +219,8 @@ router.patch("/me", updateMe);
 router.put("/me", updateMe);
 
 /* =========================
-   Troca de senha (compat com frontend)
+   Troca de senha
    ========================= */
-// POST /users/:id/password
 router.post("/:id/password", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params as { id: string };
@@ -251,7 +245,6 @@ router.post("/:id/password", async (req: Request, res: Response, next: NextFunct
   }
 });
 
-// POST /users/me/password
 router.post("/me/password", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authId = getUserIdFromReq(req);
@@ -285,12 +278,9 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id } = req.params as { id: string };
-      if (!isObjectId(id)) {
-        return res.status(400).json({ error: "Invalid id" });
-      }
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded" });
-      }
+      if (!isObjectId(id)) return res.status(400).json({ error: "Invalid id" });
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
       const publicPath = `/uploads/avatars/${req.file.filename}`;
       const updated = await User.findByIdAndUpdate(
         id,
@@ -311,14 +301,10 @@ router.post(
 router.delete("/:id", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params as { id: string };
-    if (!isObjectId(id)) {
-      return res.status(400).json({ error: "Invalid id" });
-    }
+    if (!isObjectId(id)) return res.status(400).json({ error: "Invalid id" });
 
     const deleted = await User.findByIdAndDelete(id);
-    if (!deleted) {
-      return res.status(404).json({ error: "Not found" });
-    }
+    if (!deleted) return res.status(404).json({ error: "Not found" });
 
     return res.status(204).send();
   } catch (err) {

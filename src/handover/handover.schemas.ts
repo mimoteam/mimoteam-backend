@@ -1,29 +1,20 @@
-// src/handover/handover.schemas.ts
 import { z } from "zod";
 
-export const ListHandoverQuerySchema = z.object({
-  q: z.string().trim().optional(),
-  type: z.enum(["To Know", "To Do", "Question", "VIP Client", "Guideline", "Customer Service"]).optional(),
-  tag:  z.enum(["urgent", "pending", "routine", "info"]).optional(),
-  from: z.coerce.date().optional(),
-  to:   z.coerce.date().optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(20),
-  includeTotal: z
-    .union([z.string(), z.boolean()])
-    .optional()
-    .transform((v) => {
-      const raw = String(v ?? "1").toLowerCase();
-      return !(raw === "0" || raw === "false" || raw === "no");
-    }),
+export const ListHNQuerySchema = z.object({
+  page: z.coerce.number().min(1).default(1),
+  pageSize: z.coerce.number().min(1).max(500).default(200),
+  q: z.string().optional(),
+  type: z.string().optional(),
+  tag: z.string().optional(),
+  includeTotal: z.coerce.number().min(0).max(1).default(1),
 });
 
-export const CreateHandoverSchema = z.object({
-  type: z.enum(["To Know", "To Do", "Question", "VIP Client", "Guideline", "Customer Service"]),
-  tag:  z.enum(["urgent", "pending", "routine", "info"]),
-  body: z.string().trim().min(3),
+export const CreateHNNoteSchema = z.object({
+  type: z.string().min(1),
+  tag: z.string().min(1),
+  body: z.string().min(1),
 });
 
 export const AddCommentSchema = z.object({
-  body: z.string().trim().min(2),
+  body: z.string().min(1),
 });
