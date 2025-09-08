@@ -22,6 +22,13 @@ export interface IUser extends Document {
   department?: string;
   createdAt: Date;
   updatedAt: Date;
+
+  // Virtuais (expostos via toJSON/toObject com virtuals: true)
+  // Não precisam estar no TypeScript, mas não atrapalha declarar:
+  // birthdayYMD?: string | null;
+  // hireDateYMD?: string | null;
+  // startDateYMD?: string | null;
+  // companyStartDateYMD?: string | null;
 }
 
 const userSchema = new Schema<IUser>(
@@ -73,6 +80,48 @@ function normalizeStr(v?: unknown) {
   return typeof v === "string" ? v.trim().toLowerCase() : v;
 }
 
+/* ── Helpers de data (para virtuais YYYY-MM-DD) ───────────────── */
+function dateToYMD(d?: Date | null) {
+  if (!d || isNaN(d.getTime())) return null;
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function ymdToDate(ymd?: string | null) {
+  if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  // Usa UTC para evitar drift de timezone
+  return new Date(`${ymd}T00:00:00.000Z`);
+}
+
+/* ── Virtuais YYYY-MM-DD (somente formatação/conveniência) ───── */
+userSchema.virtual("birthdayYMD").get(function (this: IUser) {
+  return dateToYMD(this.birthday ?? null);
+});
+userSchema.virtual("hireDateYMD").get(function (this: IUser) {
+  return dateToYMD(this.hireDate ?? null);
+});
+userSchema.virtual("startDateYMD").get(function (this: IUser) {
+  return dateToYMD(this.startDate ?? null);
+});
+userSchema.virtual("companyStartDateYMD").get(function (this: IUser) {
+  return dateToYMD(this.companyStartDate ?? null);
+});
+
+// Setters opcionais (permitem aceitar *_YMD caso algum cliente envie esses nomes)
+userSchema.virtual("birthdayYMD").set(function (this: any, v: string) {
+  this.birthday = ymdToDate(v);
+});
+userSchema.virtual("hireDateYMD").set(function (this: any, v: string) {
+  this.hireDate = ymdToDate(v);
+});
+userSchema.virtual("startDateYMD").set(function (this: any, v: string) {
+  this.startDate = ymdToDate(v);
+});
+userSchema.virtual("companyStartDateYMD").set(function (this: any, v: string) {
+  this.companyStartDate = ymdToDate(v);
+});
+
 /* ── save: hash e normalização ─────────────────────────────────── */
 userSchema.pre("save", async function (next) {
   const doc = this as any;
@@ -114,6 +163,11 @@ userSchema.pre("insertMany", async function (next, docs: any[]) {
       if (d.email) d.email = normalizeStr(d.email);
       if (d.login) d.login = normalizeStr(d.login);
       if (d.password) d.password = await ensureHashed(String(d.password));
+      // Se vierem *_YMD nesses imports, aceita também:
+      if (d.birthdayYMD && !d.birthday) d.birthday = ymdToDate(String(d.birthdayYMD));
+      if (d.hireDateYMD && !d.hireDate) d.hireDate = ymdToDate(String(d.hireDateYMD));
+      if (d.startDateYMD && !d.startDate) d.startDate = ymdToDate(String(d.startDateYMD));
+      if (d.companyStartDateYMD && !d.companyStartDate) d.companyStartDate = ymdToDate(String(d.companyStartDateYMD));
     })
   );
   next();

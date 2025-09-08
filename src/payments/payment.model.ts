@@ -10,11 +10,11 @@ interface INoteLog {
 export interface IPayment extends Document {
   partnerId: string;
   partnerName?: string;
-  periodFrom?: string | null;
-  periodTo?: string | null;
+  periodFrom?: string | null;  // ISO string (UTC)
+  periodTo?: string | null;    // ISO string (UTC)
   weekKey?: string | null;
-  weekStart?: string | null;
-  weekEnd?: string | null;
+  weekStart?: string | null;   // ISO string (UTC)
+  weekEnd?: string | null;     // ISO string (UTC)
   serviceIds: string[];
   extraIds: string[];
   total: number;
@@ -34,25 +34,55 @@ const NoteLogSchema = new Schema<INoteLog>(
   { _id: false }
 );
 
+// Setter conservador: tenta converter para ISO; se vier vazio/invalid, mantém null
+const toIsoOrNull = (v: any) => {
+  if (v === null || v === undefined || v === '') return null;
+  try {
+    const d = new Date(v);
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString();
+  } catch {
+    return null;
+  }
+};
+
 const PaymentSchema = new Schema<IPayment>(
   {
     partnerId:   { type: String, required: true, index: true },
     partnerName: { type: String, default: "" },
-    periodFrom:  { type: String, default: null },
-    periodTo:    { type: String, default: null },
+    periodFrom:  { type: String, default: null, set: toIsoOrNull },
+    periodTo:    { type: String, default: null, set: toIsoOrNull },
     weekKey:     { type: String, default: null, index: true },
-    weekStart:   { type: String, default: null },
-    weekEnd:     { type: String, default: null },
+    weekStart:   { type: String, default: null, set: toIsoOrNull },
+    weekEnd:     { type: String, default: null, set: toIsoOrNull },
     serviceIds:  { type: [String], default: [] },
     extraIds:    { type: [String], default: [] },
-    total:       { type: Number, default: 0 },
-    status:      { type: String, enum: ['CREATING','SHARED','APPROVED','PENDING','DECLINED','ON_HOLD','PAID'], default: 'PENDING' },
-    notes:       { type: String, default: '' },
+    total:       { type: Number,  default: 0 },
+    status:      { type: String,  enum: ['CREATING','SHARED','APPROVED','PENDING','DECLINED','ON_HOLD','PAID'], default: 'PENDING' },
+    notes:       { type: String,  default: '' },
     notesLog:    { type: [NoteLogSchema], default: [] },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    minimize: false,
+    versionKey: false,
+  }
 );
 
+// Índices que ajudam nas telas (lista por parceiro/semana/status e ordem por createdAt)
 PaymentSchema.index({ partnerId: 1, weekKey: 1 });
+PaymentSchema.index({ partnerId: 1, status: 1, createdAt: -1 });
+PaymentSchema.index({ createdAt: -1 });
+
+// Dedup de serviceIds (evita duplicados por chamadas concorrentes)
+PaymentSchema.pre('save', function (next) {
+  if (Array.isArray(this.serviceIds)) {
+    this.serviceIds = Array.from(new Set(this.serviceIds.map(String)));
+  }
+  if (Array.isArray(this.extraIds)) {
+    this.extraIds = Array.from(new Set(this.extraIds.map(String)));
+  }
+  next();
+});
 
 export default model<IPayment>('Payment', PaymentSchema);

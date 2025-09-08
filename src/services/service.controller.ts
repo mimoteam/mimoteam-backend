@@ -1,16 +1,25 @@
-// backend/src/services/service.controller.ts
-import { Request, Response } from "express";
-import { type SortOrder } from "mongoose";
-import { Service as ServiceModel } from "./service.model"; // <-- import nomeado
+import type { Request, Response, NextFunction } from "express";
+import mongoose, { Types } from "mongoose";
+import { Service } from "./service.model";
+import * as PaymentModule from "../payments/payment.model";
 
-type AnyQuery = Record<string, any>;
+/* ========================= Helpers ========================= */
+const isObjectId = (id?: string) =>
+  typeof id === "string" && Types.ObjectId.isValid(id);
 
 const toInt = (v: unknown, fb: number) => {
-  const n = parseInt(String(v));
+  const n = parseInt(String(v), 10);
   return Number.isFinite(n) ? n : fb;
 };
 
-function parsePagination(q: AnyQuery) {
+function qsStrings(v: unknown): string[] {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === "object") return [String((v as any).toString?.() ?? "")];
+  return [String(v)];
+}
+
+function parsePagination(q: Record<string, any>) {
   const hasLimitOffset = q.limit != null || q.offset != null;
   if (hasLimitOffset) {
     const pageSize = Math.min(1000, Math.max(1, toInt(q.limit, 20)));
@@ -23,124 +32,414 @@ function parsePagination(q: AnyQuery) {
   return { page, pageSize, skip: (page - 1) * pageSize };
 }
 
-export async function listServices(req: Request, res: Response) {
+function normalizeStatus(v?: string): string {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (!s) return "pending";
+  if (["waiting to approve", "waiting for approval", "shared", "waiting"].includes(s)) return "waiting to approve";
+  if (["denied", "rejected", "recusado"].includes(s)) return "denied";
+  if (["paid", "pago"].includes(s)) return "paid";
+  if (["pending", "pendente", "recorded", "rec", "approved", "aprovado"].includes(s)) return "pending";
+  return s;
+}
+
+// Se vier 'YYYY-MM-DD', grava como meio-dia UTC para evitar -1 dia por timezone.
+function coerceServiceDate(raw: any): Date | null {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return new Date(`${s}T12:00:00.000Z`);
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function buildSort(q: Record<string, any>) {
+  const sortByRaw = String(q.sortBy ?? "serviceDate").trim();
+  const sortDir = String(q.sortDir ?? "desc").toLowerCase() === "asc" ? 1 : -1;
+  const allowed = new Set([
+    "serviceDate",
+    "firstName",
+    "lastName",
+    "partnerId",
+    "team",
+    "status",
+    "createdAt",
+    "updatedAt",
+  ]);
+  const field = allowed.has(sortByRaw) ? sortByRaw : "serviceDate";
+  return { [field]: sortDir as 1 | -1, _id: -1 as const };
+}
+
+function buildFilter(q: Record<string, any>) {
+  const f: any = {};
+  const status = qsStrings(q.status)[0];
+  const partnerId = (qsStrings(q.partnerId)[0] ?? qsStrings(q.partner)[0]) || undefined;
+  const team = qsStrings(q.team)[0];
+  const serviceTypeId = (qsStrings(q.serviceTypeId)[0] ?? qsStrings(q.serviceType)[0]) || undefined;
+  const qtext = (qsStrings(q.q)[0] ?? qsStrings(q.search)[0]) || undefined;
+
+  if (status) f.status = normalizeStatus(status);
+  if (partnerId) f.partnerId = partnerId;
+  if (team) f.team = new RegExp(`^${team}$`, "i");
+  if (serviceTypeId) f.serviceTypeId = serviceTypeId;
+
+  if (qtext) {
+    const rx = new RegExp(String(qtext).trim(), "i");
+    f.$or = [
+      { clientName: rx },
+      { firstName: rx },
+      { lastName: rx },
+      { observations: rx },
+      { "partner.name": rx },
+      { team: rx },
+      { park: rx },
+      { location: rx },
+    ];
+  }
+  return f;
+}
+
+/* ========= Payment model (opcional/robusto) ========= */
+function getPaymentModel(): mongoose.Model<any> | null {
+  const anyMod = PaymentModule as any;
+  if (anyMod?.default?.findOne) return anyMod.default as mongoose.Model<any>;
+  if (anyMod?.Payment?.findOne) return anyMod.Payment as mongoose.Model<any>;
   try {
-    const { page, pageSize, skip } = parsePagination(req.query);
-    const sortBy = (String(req.query.sortBy || "serviceDate") || "serviceDate").trim();
-    const sortDir: SortOrder =
-      String(req.query.sortDir || "desc").toLowerCase() === "asc" ? 1 : -1;
+    const m = mongoose.model("Payment");
+    if ((m as any)?.findOne) return m as mongoose.Model<any>;
+  } catch {}
+  return null;
+}
 
-    const filter: AnyQuery = {};
+type LinkInfo = {
+  paymentId: string;
+  status: "pending" | "paid" | "declined";
+  ts: number;
+};
+const normPaymentStatus = (s: any): LinkInfo["status"] => {
+  const up = String(s || "").toUpperCase();
+  if (up === "PAID") return "paid";
+  if (up === "DECLINED") return "declined";
+  return "pending";
+};
 
-    // filtros de acordo com o schema
-    if (req.query.partner) filter.partnerId = String(req.query.partner);
-    if (req.query.serviceType) filter.serviceTypeId = String(req.query.serviceType);
-    if (req.query.team) filter.team = String(req.query.team);
-    if (req.query.status) filter.status = String(req.query.status);
+async function getFirstPaymentLink(id: string) {
+  const Payment = getPaymentModel();
+  if (!Payment) return null;
+  const arr: any[] = [id];
+  if (Types.ObjectId.isValid(id)) arr.push(new Types.ObjectId(id));
+  const doc = await Payment.findOne(
+    { serviceIds: { $in: arr } },
+    { _id: 1, status: 1, updatedAt: 1, createdAt: 1 }
+  ).sort({ updatedAt: -1, _id: -1 }).lean();
+  if (!doc) return null;
+  return { paymentId: String((doc as any)._id), status: normPaymentStatus((doc as any).status) };
+}
 
-    if (req.query.dateFrom || req.query.dateTo) {
-      const range: AnyQuery = {};
-      if (req.query.dateFrom) range.$gte = new Date(String(req.query.dateFrom));
-      if (req.query.dateTo) range.$lte = new Date(String(req.query.dateTo));
-      filter.serviceDate = range;
+async function mapPaymentLinksByServiceIds(ids: string[]) {
+  const Payment = getPaymentModel();
+  if (!Payment) return new Map<string, LinkInfo>();
+  const idsStr = Array.from(new Set(ids.map(String)));
+  const objIds = idsStr.filter(Types.ObjectId.isValid).map((s) => new Types.ObjectId(s));
+
+  const [byStr, byObj] = await Promise.all([
+    Payment.find({ serviceIds: { $in: idsStr } }, { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }).lean(),
+    objIds.length
+      ? Payment.find({ serviceIds: { $in: objIds } }, { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }).lean()
+      : Promise.resolve([] as any[]),
+  ]);
+
+  const map = new Map<string, LinkInfo>();
+  const idsSet = new Set(idsStr);
+  for (const p of [...byStr, ...byObj] as any[]) {
+    const pid = String(p._id);
+    const ts: number = new Date(p.updatedAt || p.createdAt || Date.now()).getTime();
+    const status = normPaymentStatus(p.status);
+    for (const sid of (p.serviceIds || [])) {
+      const key = String(sid);
+      if (!idsSet.has(key)) continue;
+      const prev = map.get(key);
+      if (!prev || ts >= prev.ts) map.set(key, { paymentId: pid, status, ts });
     }
+  }
+  return map;
+}
 
-    if (req.query.q) {
-      const q = String(req.query.q).trim();
-      if (q) {
-        filter.$or = [
-          { firstName: { $regex: q, $options: "i" } },
-          { lastName:  { $regex: q, $options: "i" } },
-          { clientName:{ $regex: q, $options: "i" } },
-        ];
-      }
-    }
+/* ========================= Controllers ========================= */
 
-    const sort: Record<string, SortOrder> = { [sortBy]: sortDir, _id: -1 };
+// GET /services
+export async function listServices(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { page, pageSize, skip } = parsePagination(req.query as any);
+    const filter = buildFilter(req.query as any);
+    const sort = buildSort(req.query as any);
 
-    const [docs, total] = await Promise.all([
-      ServiceModel.find(filter).sort(sort).skip(skip).limit(pageSize).lean(),
-      ServiceModel.countDocuments(filter),
+    const [items, total] = await Promise.all([
+      Service.find(filter).collation({ locale: "en", strength: 2 }).sort(sort).skip(skip).limit(pageSize).lean(),
+      Service.countDocuments(filter),
     ]);
 
+    let itemsOut = items as any[];
+    try {
+      const ids = items.map((it: any) => String(it._id));
+      const links = await mapPaymentLinksByServiceIds(ids);
+      itemsOut = items.map((it: any) => {
+        const link = links.get(String(it._id));
+        return { ...it, paymentId: link?.paymentId ?? null, paymentStatus: link?.status ?? null, isLocked: !!link };
+      });
+    } catch {} // enriquecimento não derruba a lista
+
     res.json({
-      items: docs,
+      items: itemsOut,
       total,
       totalRecords: total,
       totalPages: Math.max(1, Math.ceil(total / pageSize)),
       page,
       pageSize,
     });
-  } catch (e: any) {
-    res.status(500).json({ message: e.message || "Failed to list services" });
+  } catch (err) {
+    next(err);
   }
 }
 
-export async function createService(req: Request, res: Response) {
+// GET /services/:id
+export async function getService(req: Request, res: Response, next: NextFunction) {
   try {
-    const b = req.body ?? {};
-    const finalValue = Number(b.finalValue ?? b.suggestedValue ?? 0);
+    const { id } = req.params as { id: string };
+    if (!isObjectId(id)) return res.status(400).json({ error: "Invalid id" });
+    const doc: any = await Service.findById(id).lean();
+    if (!doc) return res.status(404).json({ error: "Not found" });
 
-    const doc = await ServiceModel.create({
-      firstName: b.firstName ?? "",
-      lastName: b.lastName ?? "",
-      serviceDate: b.serviceDate ? new Date(b.serviceDate) : new Date(),
-      // partnerId como string + subdoc opcional, de acordo com o schema
-      partnerId: b.partnerId ?? (typeof b.partner === "string" ? b.partner : ""),
-      partner: typeof b.partner === "object" ? b.partner : null,
-      team: b.team ?? "",
-      serviceTypeId: b.serviceTypeId ?? (typeof b.serviceType === "string" ? b.serviceType : ""),
-      serviceType: typeof b.serviceType === "object" ? b.serviceType : null,
-      serviceTime: b.serviceTime ?? null,
-      park: b.park ?? "",
-      location: b.location ?? "",
-      hopper: !!b.hopper,
-      guests: b.guests ?? null,
-      observations: b.observations ?? "",
-      finalValue: Number.isFinite(finalValue) ? finalValue : 0,
-      overrideValue: b.overrideValue ?? null,
-      calculatedPrice: b.calculatedPrice ?? null,
-      status: b.status || "RECORDED",
-    });
+    let paymentId: string | null = null;
+    let paymentStatus: "pending" | "paid" | "declined" | null = null;
+    try {
+      const link = await getFirstPaymentLink(id);
+      paymentId = link?.paymentId ?? null;
+      paymentStatus = link?.status ?? null;
+    } catch {}
 
-    res.status(201).json({ item: doc });
-  } catch (e: any) {
-    res.status(400).json({ message: e.message || "Failed to create service" });
+    res.json({ ...doc, paymentId, paymentStatus, isLocked: !!paymentId });
+  } catch (err) {
+    next(err);
   }
 }
 
-export async function bulkCreateServices(req: Request, res: Response) {
+// POST /services
+export async function createService(req: Request, res: Response, next: NextFunction) {
   try {
-    const body = req.body;
-    const items = Array.isArray(body?.items) ? body.items : Array.isArray(body) ? body : [];
-    if (!items.length) return res.status(400).json({ message: "No items" });
+    const b = req.body || {};
+    const payload: any = { ...b, serviceDate: coerceServiceDate(b.serviceDate) ?? new Date(), status: normalizeStatus(b.status) };
+    delete payload._id; delete payload.id;
 
-    const docs = await ServiceModel.insertMany(
-      items.map((b: any) => ({
-        firstName: b.firstName ?? "",
-        lastName: b.lastName ?? "",
-        serviceDate: b.serviceDate ? new Date(b.serviceDate) : new Date(),
-        partnerId: b.partnerId ?? (typeof b.partner === "string" ? b.partner : ""),
-        partner: typeof b.partner === "object" ? b.partner : null,
-        team: b.team ?? "",
-        serviceTypeId: b.serviceTypeId ?? (typeof b.serviceType === "string" ? b.serviceType : ""),
-        serviceType: typeof b.serviceType === "object" ? b.serviceType : null,
-        serviceTime: b.serviceTime ?? null,
-        park: b.park ?? "",
-        location: b.location ?? "",
-        hopper: !!b.hopper,
-        guests: b.guests ?? null,
-        observations: b.observations ?? "",
-        finalValue: Number(b.finalValue ?? b.suggestedValue ?? 0) || 0,
-        overrideValue: b.overrideValue ?? null,
-        calculatedPrice: b.calculatedPrice ?? null,
-        status: b.status || "RECORDED",
-      })),
-      { ordered: false }
+    const created: any = await Service.create(payload);
+    const fresh = await Service.findById(String(created?._id)).lean();
+
+    res.status(201).json({ ...(fresh as any), paymentId: null, paymentStatus: null, isLocked: false });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /services/bulk  — resiliente (nunca 500 por erro de item)
+ * Aceita: array | {items|services|rows|data}
+ * Cria item-a-item e devolve resumo {inserted, failed[], items[]}
+ */
+export async function bulkCreateServices(req: Request, res: Response, next: NextFunction) {
+  try {
+    const body = (req.body ?? {}) as any;
+
+    let arr: any[] = [];
+    if (Array.isArray(body)) arr = body;
+    else if (Array.isArray(body.items)) arr = body.items;
+    else if (Array.isArray(body.services)) arr = body.services;
+    else if (Array.isArray(body.rows)) arr = body.rows;
+    else if (Array.isArray(body.data)) arr = body.data;
+
+    if (!arr.length) return res.status(400).json({ error: "Empty items" });
+
+    const inserted: any[] = [];
+    const failed: Array<{ index: number; error: string }> = [];
+
+    for (let i = 0; i < arr.length; i++) {
+      const b = arr[i] ?? {};
+      try {
+        const p: any = {
+          ...b,
+          serviceDate: coerceServiceDate(b.serviceDate) ?? new Date(),
+          status: normalizeStatus(b.status),
+        };
+        delete p._id; delete p.id;
+
+        const doc: any = await Service.create(p);
+        const fresh = await Service.findById(String(doc?._id)).lean();
+        if (fresh) inserted.push(fresh);
+      } catch (e: any) {
+        failed.push({ index: i, error: e?.message || "unknown" });
+      }
+    }
+
+    if (inserted.length === 0) {
+      // nada deu certo → 400 para o front não tentar formatos alternativos e não duplicar
+      return res.status(400).json({ inserted: 0, failed: failed.length, errors: failed });
+    }
+
+    // houve ao menos um sucesso → 201 com resumo
+    return res.status(201).json({ items: inserted, inserted: inserted.length, failed: failed.length, errors: failed });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /services/:id
+export async function updateService(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { id } = req.params as { id: string };
+    if (!isObjectId(id)) return res.status(400).json({ error: "Invalid id" });
+
+    try {
+      const link = await getFirstPaymentLink(id);
+      if (link) {
+        return res.status(409).json({ error: "locked", message: "Service is linked to a payment and cannot be modified.", paymentId: link.paymentId, paymentStatus: link.status });
+      }
+    } catch {}
+
+    const patch: any = { ...(req.body || {}) };
+    delete patch._id; delete patch.id;
+    if (patch.status) patch.status = normalizeStatus(patch.status);
+    if (patch.serviceDate !== undefined) patch.serviceDate = coerceServiceDate(patch.serviceDate) ?? undefined;
+
+    const updated = await Service.findByIdAndUpdate(id, { $set: patch }, { new: true, runValidators: true, upsert: false })
+      .collation({ locale: "en", strength: 2 });
+    if (!updated) return res.status(404).json({ error: "Not found" });
+
+    res.json({ ...(updated.toObject() as any), paymentId: null, paymentStatus: null, isLocked: false });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /services/:id
+export async function deleteService(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { id } = req.params as { id: string };
+    if (!isObjectId(id)) return res.status(400).json({ error: "Invalid id" });
+
+    try {
+      const link = await getFirstPaymentLink(id);
+      if (link) {
+        return res.status(409).json({
+          error: "locked",
+          message: "Service is linked to a payment and cannot be deleted.",
+          paymentId: link.paymentId,
+          paymentStatus: link.status,
+        });
+      }
+    } catch {}
+
+    const del = await Service.findByIdAndDelete(id).lean();
+    if (!del) return res.status(404).json({ error: "Not found" });
+
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}
+
+/* ========= BULK DELETE ========= */
+function parseIdsFromReq(req: Request): string[] {
+  const out = new Set<string>();
+
+  // ?ids=csv | ?ids=a&ids=b
+  const qIds = (req.query as any).ids;
+  if (Array.isArray(qIds)) {
+    qIds.forEach((v) =>
+      String(v).split(",").map((s) => s.trim()).filter(Boolean).forEach((id) => out.add(id))
     );
+  } else if (qIds) {
+    String(qIds).split(",").map((s) => s.trim()).filter(Boolean).forEach((id) => out.add(id));
+  }
 
-    res.status(201).json({ inserted: docs.length, items: docs });
-  } catch (e: any) {
-    res.status(400).json({ message: e.message || "Failed to bulk insert services" });
+  // ?ids[]=a&ids[]=b
+  const qIdsArray = (req.query as any)["ids[]"];
+  if (Array.isArray(qIdsArray)) {
+    qIdsArray.map((s) => String(s).trim()).filter(Boolean).forEach((id) => out.add(id));
+  } else if (qIdsArray) {
+    out.add(String(qIdsArray).trim());
+  }
+
+  // body { ids: [...] }
+  const bodyIds = Array.isArray((req.body as any)?.ids) ? (req.body as any).ids : [];
+  bodyIds.map((s: any) => String(s).trim()).filter(Boolean).forEach((id: string) => out.add(id));
+
+  return Array.from(out).filter(isObjectId);
+}
+
+export async function deleteManyServices(req: Request, res: Response, next: NextFunction) {
+  try {
+    const ids = parseIdsFromReq(req);
+    if (!ids.length) return res.status(400).json({ error: "Missing ids" });
+
+    // tenta descobrir bloqueados por pagamento — mas sem derrubar a rota
+    let linkedSet = new Set<string>();
+    const Payment = getPaymentModel();
+
+    if (Payment) {
+      try {
+        const objIds = ids.map((s) => new Types.ObjectId(s));
+        const [byStr, byObj] = await Promise.all([
+          Payment.find({ serviceIds: { $in: ids } }, { serviceIds: 1 }).lean(),
+          Payment.find({ serviceIds: { $in: objIds } }, { serviceIds: 1 }).lean(),
+        ]);
+        [...byStr, ...byObj].forEach((p: any) => (p.serviceIds || []).forEach((sid: any) => linkedSet.add(String(sid))));
+      } catch {
+        linkedSet = new Set(); // degrade
+      }
+    }
+
+    const free = ids.filter((id) => !linkedSet.has(id));
+    const linked = ids.filter((id) => linkedSet.has(id));
+
+    let deleted = 0;
+    if (free.length) {
+      const CHUNK = 500;
+      for (let i = 0; i < free.length; i += CHUNK) {
+        const slice = free.slice(i, i + CHUNK);
+        const r = await Service.deleteMany({ _id: { $in: slice } });
+        deleted += r.deletedCount || 0;
+      }
+    }
+
+    return res.json({
+      deleted,
+      blocked: linked.length,
+      blockedIds: linked,
+      processedIds: ids.length,
+    });
+  } catch (err) {
+    // última proteção: evitar 500
+    try {
+      return res.status(200).json({
+        deleted: 0,
+        blocked: 0,
+        blockedIds: [],
+        processedIds: 0,
+        warn: "degraded_mode",
+      });
+    } catch {
+      next(err);
+    }
   }
 }
+
+/* ========================= Export ========================= */
+const ServiceController = {
+  listServices,
+  getService,
+  createService,
+  bulkCreateServices,
+  updateService,
+  deleteService,
+  deleteManyServices,
+};
+
+export default ServiceController;

@@ -1,61 +1,33 @@
-// src/tasks/task.model.ts
-import { Schema, model, models, type Document, type Model, Types } from "mongoose";
+import mongoose, { Schema, Types } from "mongoose";
 
-export type TaskPriority = "low" | "medium" | "high";
-
-export interface ITask extends Document {
+export interface TaskDoc {
   _id: Types.ObjectId;
   text: string;
+  status: "todo" | "in_progress" | "done";
   completed: boolean;
-  priority: TaskPriority;
+  priority?: "low" | "medium" | "high";
   dueDate?: Date | null;
-
-  createdById?: Types.ObjectId | null;
-  createdByName?: string | null;
-
-  assignedToId?: Types.ObjectId | null;
+  assignedToId?: string | null;
   assignedToName?: string | null;
-
+  createdBy?: string | null;
+  createdByName?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
 
-const taskSchema = new Schema<ITask>(
+const TaskSchema = new Schema<TaskDoc>(
   {
     text: { type: String, required: true, trim: true },
+    status: { type: String, enum: ["todo", "in_progress", "done"], default: "todo", index: true },
     completed: { type: Boolean, default: false, index: true },
     priority: { type: String, enum: ["low", "medium", "high"], default: "medium" },
     dueDate: { type: Date, default: null },
-
-    createdById: { type: Schema.Types.ObjectId, ref: "User", default: null, index: true },
-    createdByName: { type: String, default: null },
-
-    assignedToId: { type: Schema.Types.ObjectId, ref: "User", default: null, index: true },
+    assignedToId: { type: String, default: null, index: true },
     assignedToName: { type: String, default: null },
+    createdBy: { type: String, default: null },
+    createdByName: { type: String, default: null },
   },
   { timestamps: true }
 );
 
-// índices
-taskSchema.index({ createdAt: -1 });
-taskSchema.index({ text: "text" }, { name: "task_text" });
-
-// limpeza json
-taskSchema.set("toJSON", {
-  virtuals: true,
-  transform: (_doc, ret) => {
-    const { __v, ...rest } = ret || {};
-    return rest;
-  },
-});
-taskSchema.set("toObject", {
-  virtuals: true,
-  transform: (_doc, ret) => {
-    const { __v, ...rest } = ret || {};
-    return rest;
-  },
-});
-
-const TaskModel: Model<ITask> = (models.Task as Model<ITask>) || model<ITask>("Task", taskSchema);
-export default TaskModel;
-export { TaskModel };
+export const Task = mongoose.models.Task || mongoose.model<TaskDoc>("Task", TaskSchema);

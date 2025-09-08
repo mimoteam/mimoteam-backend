@@ -1,156 +1,219 @@
-// backend/src/availability/availability.routes.ts
+// src/availability/availability.routes.ts
+type AvRow = { date: string; state: "busy" | "unavailable"; by?: "admin" | "partner" | "unknown" };
+
 import { Router } from "express";
 import { Availability } from "./availability.model";
+import { Types } from "mongoose";
 
 const router = Router();
 
-const isYmd = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+/* ===== helpers ===== */
+const isYmd = (v: unknown): v is string =>
+  typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
-/**
- * GET /availability?partnerId=...&dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
- * Retorna apenas dias != 'available'
- */
-router.get("/", async (req, res, next) => {
+const PROJ = { _id: 0, date: 1, state: 1, by: 1 } as const;
+
+/** Descobre o tipo real do campo partnerId no schema (String | ObjectId) e normaliza o valor */
+function resolvePartnerId(raw: string) {
+  const path: any = (Availability as any).schema?.path?.("partnerId");
+  const instance = String(path?.instance || "").toLowerCase();
+  if (instance === "objectid") {
+    if (!Types.ObjectId.isValid(raw)) return null;
+    return new Types.ObjectId(raw);
+  }
+  const s = String(raw || "").trim();
+  return s || null;
+}
+
+/* =========================================================================
+GET /availability?partnerId=&dateFrom=&dateTo=
+— usa o driver nativo para evitar cast no campo "date" (String com $gte/$lte)
+========================================================================= */
+router.get("/", async (req, res) => {
   try {
-    const partnerId = String(req.query.partnerId || "");
-    const dateFrom = String(req.query.dateFrom || "");
-    const dateTo = String(req.query.dateTo || "");
+    const q = req.query as Record<string, any>;
+    const partnerIdRaw = String(q.partnerId || "");
+    const from = String(q.dateFrom || "");
+    const to   = String(q.dateTo   || "");
 
-    if (!partnerId) return res.status(400).json({ error: "partnerId is required" });
-    if (!isYmd(dateFrom) || !isYmd(dateTo)) {
-      return res.status(400).json({ error: "dateFrom/dateTo must be YYYY-MM-DD" });
+    if (!partnerIdRaw || !isYmd(from) || !isYmd(to)) {
+      return res.status(400).json({ message: "partnerId, dateFrom e dateTo são obrigatórios (YYYY-MM-DD)" });
     }
 
-    const items = await Availability.find({
-      partnerId,
-      date: { $gte: dateFrom, $lte: dateTo },
-    })
-      .sort({ date: 1 })
-      .lean();
+    const pid = resolvePartnerId(partnerIdRaw);
+    if (!pid) return res.status(400).json({ message: "Invalid partnerId" });
 
-    res.json({
-      items: items.map((d) => ({
-        date: d.date,
-        state: d.state,
-        by: d.by,
-      })),
-      total: items.length,
-    });
-  } catch (e) {
-    next(e);
+    const rows = await (Availability as any).collection
+      .find({ partnerId: pid, date: { $gte: from, $lte: to } }, { projection: PROJ })
+      .sort({ date: 1 })
+      .toArray();
+
+    return res.json(rows || []);
+  } catch (err: any) {
+    console.error("GET /availability error:", err?.message);
+    // se preferir fail-open:
+    // return res.json([]);
+    return res.status(500).json({ error: "list_failed", message: err?.message || "unknown" });
   }
 });
 
-/**
- * PATCH /availability/:date
- * body: { partnerId, state: 'available'|'unavailable'|'busy', actor: 'admin'|'partner' }
- * - 'available' => apaga o registro (estado implícito)
- * - parceiro não consegue sobrescrever 'busy'
- */
-router.patch("/:date", async (req, res, next) => {
+/* =========================================================================
+PATCH /availability/:date
+— operações sem operadores em "date" podem usar Mongoose normalmente
+========================================================================= */
+router.patch("/:date", async (req, res) => {
   try {
-    const date = String(req.params.date || "");
-    const partnerId = String(req.body?.partnerId || "");
-    const state = String(req.body?.state || "");
-    const actor = (String(req.body?.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner") as "admin"|"partner";
+    const date = String(req.params?.date || "");
+    const body = (req.body ?? {}) as Record<string, any>;
 
-    if (!partnerId) return res.status(400).json({ error: "partnerId is required" });
-    if (!isYmd(date)) return res.status(400).json({ error: "Invalid date (YYYY-MM-DD)" });
+    const partnerIdRaw = String(body.partnerId || "");
+    const state = String(body.state || "").toLowerCase();
+    const actor: "admin" | "partner" =
+      String(body.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner";
+
+    if (!partnerIdRaw) return res.status(400).json({ error: "partnerId is required" });
+    if (!isYmd(date))   return res.status(400).json({ error: "Invalid date (YYYY-MM-DD)" });
     if (!["available", "unavailable", "busy"].includes(state)) {
       return res.status(400).json({ error: "state must be available|unavailable|busy" });
     }
 
-    const existing = await Availability.findOne({ partnerId, date }).lean();
+    // normaliza partnerId conforme o tipo do schema
+    const path: any = (Availability as any).schema?.path?.("partnerId");
+    const instance = String(path?.instance || "").toLowerCase();
 
-    // parceiro não muda um dia já 'busy'
+    const mkPid = (raw: string) => {
+      if (instance === "objectid") {
+        if (!Types.ObjectId.isValid(raw)) throw new Error("Invalid partnerId");
+        const oid = new Types.ObjectId(raw);
+        return { filter: { partnerId: oid }, value: oid };
+      }
+      const s = String(raw || "").trim();
+      if (!s) throw new Error("Invalid partnerId");
+      return { filter: { partnerId: s }, value: s };
+    };
+
+    const { filter, value } = mkPid(partnerIdRaw);
+
+    // se já está busy, partner não pode liberar
+    const existing = await (Availability as any)
+      .findOne({ ...filter, date }, { _id: 0, date: 1, state: 1, by: 1 })
+      .lean();
+
     if (actor === "partner" && existing?.state === "busy") {
-      return res.json({ date, state: "busy", by: existing.by, unchanged: true });
+      return res.json({ date, state: "busy", by: existing.by || "admin", unchanged: true });
     }
 
     if (state === "available") {
-      await Availability.deleteOne({ partnerId, date });
+      await (Availability as any).deleteMany({ ...filter, date });
       return res.json({ date, state: "available" });
     }
 
-    const updated = await Availability.findOneAndUpdate(
-      { partnerId, date },
-      { $set: { partnerId, date, state, by: actor } },
-      { new: true, upsert: true }
-    ).lean();
+    await (Availability as any).updateOne(
+      { ...filter, date },
+      { $set: { partnerId: value, date, state: state as "busy" | "unavailable", by: actor } },
+      { upsert: true }
+    );
 
-    res.json({ date: updated!.date, state: updated!.state, by: updated!.by });
-  } catch (e) {
-    next(e);
+    return res.json({ date, state, by: actor });
+  } catch (e: any) {
+    console.error("PATCH /availability failed:", e?.message);
+    return res.status(500).json({ error: "patch_failed", message: e?.message || "unknown" });
   }
 });
 
-/**
- * POST /availability/bulk
- * body: { partnerId, from, to, weekdays?: number[], state: 'available'|'unavailable', actor: 'admin'|'partner' }
- * - aplica apenas em dias do range (e weekdays se passado)
- * - parceiro não sobrescreve 'busy'
- */
-router.post("/bulk", async (req, res, next) => {
+/* =========================================================================
+POST /availability/bulk
+— gera lista de dias (UTC) e checa "busy" via driver nativo (date: {$in: [...]})
+========================================================================= */
+router.post("/bulk", async (req, res) => {
   try {
-    const partnerId = String(req.body?.partnerId || "");
-    const from = String(req.body?.from || "");
-    const to = String(req.body?.to || "");
-    const state = String(req.body?.state || "");
-    const actor = (String(req.body?.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner") as "admin"|"partner";
-    const weekdays: number[] = Array.isArray(req.body?.weekdays) ? req.body.weekdays.map((n: any) => Number(n)) : [];
+    const b = (req.body ?? {}) as Record<string, any>;
+    const partnerIdRaw = String(b.partnerId || "");
+    const from = String(b.from || "");
+    const to   = String(b.to   || "");
+    const state = String(b.state || "").toLowerCase(); // "available" | "unavailable"
+    const actor: "admin" | "partner" =
+      String(b.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner";
+    const weekdays: number[] = Array.isArray(b.weekdays)
+      ? b.weekdays.map((n:any) => Number(n)).filter((n:number) => Number.isInteger(n) && n>=0 && n<=6)
+      : [];
 
-    if (!partnerId) return res.status(400).json({ error: "partnerId is required" });
+    if (!partnerIdRaw) return res.status(400).json({ error: "partnerId is required" });
     if (!isYmd(from) || !isYmd(to)) return res.status(400).json({ error: "from/to must be YYYY-MM-DD" });
-    if (!["available", "unavailable"].includes(state)) {
+    if (!["available","unavailable"].includes(state)) {
       return res.status(400).json({ error: "state must be available|unavailable" });
     }
 
-    const d1 = new Date(from);
-    const d2 = new Date(to);
+    // partnerId normalizado
+    const pid = resolvePartnerId(partnerIdRaw);
+    if (!pid) return res.status(400).json({ error: "Invalid partnerId" });
+
+    // gera chaves YYYY-MM-DD (UTC) deduplicadas dentro do range + weekdays
+    const d1 = new Date(from), d2 = new Date(to);
     if (Number.isNaN(+d1) || Number.isNaN(+d2) || d1 > d2) {
       return res.status(400).json({ error: "Invalid date range" });
     }
+    const toKeyUTC = (d: Date) => {
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth()+1).padStart(2,'0');
+      const da= String(d.getUTCDate()).padStart(2,'0');
+      return `${y}-${m}-${da}`;
+    };
 
-    // carrega existentes no range para evitar sobrescrever busy
-    const existing = await Availability.find({
-      partnerId,
-      date: { $gte: from, $lte: to },
-    }).lean();
-    const map = new Map(existing.map((e) => [e.date, e]));
-
-    let upserts = 0, deleted = 0, skippedBusy = 0;
-
-    const cur = new Date(d1);
-    while (cur <= d2) {
-      const dayKey = cur.toISOString().slice(0, 10);
-      const dow = cur.getDay();
+    const seen = new Set<string>();
+    const keys: string[] = [];
+    const cur = new Date(Date.UTC(d1.getUTCFullYear(), d1.getUTCMonth(), d1.getUTCDate()));
+    const end = new Date(Date.UTC(d2.getUTCFullYear(), d2.getUTCMonth(), d2.getUTCDate()));
+    while (cur <= end) {
+      const dow = cur.getUTCDay();
       if (!weekdays.length || weekdays.includes(dow)) {
-        const ex = map.get(dayKey);
-
-        // parceiro não mexe em 'busy'
-        if (actor === "partner" && ex?.state === "busy") {
-          skippedBusy++;
-        } else if (state === "available") {
-          if (ex) {
-            await Availability.deleteOne({ partnerId, date: dayKey });
-            deleted++;
-          }
-        } else {
-          // state === 'unavailable'
-          await Availability.updateOne(
-            { partnerId, date: dayKey },
-            { $set: { partnerId, date: dayKey, state: "unavailable", by: actor } },
-            { upsert: true }
-          );
-          upserts++;
-        }
+        const k = toKeyUTC(cur);
+        if (!seen.has(k)) { seen.add(k); keys.push(k); }
       }
-      cur.setDate(cur.getDate() + 1);
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    if (!keys.length) return res.json({ upserts: 0, deleted: 0, skippedBusy: 0 });
+
+    // partner não sobrescreve dias busy — checa via driver nativo (evita cast do Mongoose)
+    let busySet = new Set<string>();
+    if (actor === "partner") {
+      const busyRows: { date: string }[] = await (Availability as any).collection
+        .find({ partnerId: pid, state: "busy", date: { $in: keys } }, { projection: { _id: 0, date: 1 } })
+        .toArray();
+      busySet = new Set(busyRows.map(r => r.date));
     }
 
-    res.json({ upserts, deleted, skippedBusy });
-  } catch (e) {
-    next(e);
+    // monta operações únicas por dia
+    const ops: any[] = [];
+    let upserts = 0, deleted = 0, skippedBusy = 0;
+
+    for (const k of keys) {
+      if (actor === "partner" && busySet.has(k)) { skippedBusy++; continue; }
+
+      if (state === "available") {
+        ops.push({ deleteOne: { filter: { partnerId: pid, date: k } } });
+        deleted++;
+      } else {
+        ops.push({
+          updateOne: {
+            filter: { partnerId: pid, date: k },
+            update: { $set: { partnerId: pid, date: k, state: "unavailable", by: actor } },
+            upsert: true,
+          }
+        });
+        upserts++;
+      }
+    }
+
+    if (!ops.length) return res.json({ upserts, deleted, skippedBusy });
+
+    // ordered:true evita colisão interna caso a mesma chave apareça 2x por algum motivo
+    await (Availability as any).bulkWrite(ops, { ordered: true });
+
+    return res.json({ upserts, deleted, skippedBusy });
+  } catch (e:any) {
+    console.error("POST /availability/bulk error:", e?.message);
+    return res.status(500).json({ error: "bulk_failed", message: e?.message || "unknown" });
   }
 });
 
