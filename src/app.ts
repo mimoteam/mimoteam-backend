@@ -24,7 +24,7 @@ import { auth } from "./middleware/auth";
 import { notFound, errorHandler } from "./middleware/error";
 import { env } from "./config/env";
 
-/* ✅ NOVO: rotas do Lightning Lane */
+/* ✅ Lightning Lane */
 import lanesRouter from "./lightninglanes/ll.routes";
 
 let debugRoutes: any = null;
@@ -51,10 +51,9 @@ const envOrigins = (process.env.CORS_ORIGIN || DEFAULT_ORIGINS.join(","))
 
 const allowed = new Set(envOrigins);
 
-/* 🔥 HOTFIX de preflight — responde imediatamente com headers válidos */
+/* HOTFIX preflight */
 app.use((req, res, next) => {
   if (req.method !== "OPTIONS") return next();
-
   const origin = (req.headers.origin as string) || "";
   const acrh =
     (req.headers["access-control-request-headers"] as string) ||
@@ -87,7 +86,7 @@ app.use((req, res, next) => {
 
 const corsOptions: CorsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl / health checks
+    if (!origin) return cb(null, true);
     if (allowed.has(origin)) return cb(null, true);
     if (
       process.env.NODE_ENV !== "production" &&
@@ -173,26 +172,29 @@ const mirror = (paths: string[], ...handlers: any[]) => {
   paths.forEach((p) => app.use(p, ...handlers));
 };
 
-/* ===== Rotas públicas ===== */
+/* ===== Rotas ===== */
 mirror(["/auth", "/api/auth"], authRoutes);
 mirror(["/users", "/api/users"], userRoutes);
 mirror(["/services", "/api/services"], serviceRoutes);
 mirror(["/costs", "/api/costs"], costRoutes);
-mirror(["/payments", "/api/payments"], paymentRoutes);
+
+/* 🔧 AQUI ESTAVA O PROBLEMA — precisa INVOCAR o factory */
+mirror(["/payments", "/api/payments"], auth(), paymentRoutes);
+
 mirror(["/availability", "/api/availability"], availabilityRoutes);
 mirror(["/upload", "/api/upload"], uploadRoutes);
 mirror(["/status", "/api/status"], statusRoutes);
 
-/* ✅ Lightning Lane (router cuida do auth por rota) */
+/* Lightning Lane */
 app.use("/lanes", lanesRouter);
 app.use("/api/lanes", lanesRouter);
 
-/* ===== Rotas de debug (apenas DEV) ===== */
+/* Debug (DEV) */
 if (debugRoutes) {
   app.use("/api", debugRoutes);
 }
 
-// ---- NOOP stubs: tasks & handover desativados, mas o front ainda chama ----
+/* NOOP stubs, se quiser manter */
 const noopListHandler: RequestHandler = (req: Request, res: Response) => {
   const page = Number((req.query?.page as string) || "1");
   const pageSize = Number((req.query?.pageSize as string) || "50");
@@ -211,7 +213,6 @@ const noopListHandler: RequestHandler = (req: Request, res: Response) => {
   "/api/shift-handover",
   "/shift-handover",
 ].forEach((p) => app.get(p, noopListHandler));
-// ---------------------------------------------------------------------------
 
 /* ===== 404 + erro ===== */
 app.use(notFound);

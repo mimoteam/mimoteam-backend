@@ -1,3 +1,4 @@
+// src/services/service.controller.ts
 import type { Request, Response, NextFunction } from "express";
 import mongoose, { Types } from "mongoose";
 import { Service } from "./service.model";
@@ -69,33 +70,76 @@ function buildSort(q: Record<string, any>) {
   return { [field]: sortDir as 1 | -1, _id: -1 as const };
 }
 
+/** Coleta robusta de IDs da query (?ids=csv | ?ids=a&ids=b | ?ids[]=a&ids[]=b) */
+function collectIds(q: Record<string, any>): string[] {
+  const out = new Set<string>();
+  const addCsv = (v: any) =>
+    String(v ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .forEach((id) => out.add(id));
+
+  // ?ids=csv | ?ids=a&ids=b
+  const idsParam = (q as any).ids;
+  if (Array.isArray(idsParam)) idsParam.forEach(addCsv);
+  else if (idsParam) addCsv(idsParam);
+
+  // ?ids[]=a&ids[]=b
+  const idsArray = (q as any)["ids[]"];
+  if (Array.isArray(idsArray)) {
+    idsArray.map((s) => String(s).trim()).filter(Boolean).forEach((id) => out.add(id));
+  } else if (idsArray) {
+    out.add(String(idsArray).trim());
+  }
+
+  return Array.from(out);
+}
+
 function buildFilter(q: Record<string, any>) {
-  const f: any = {};
   const status = qsStrings(q.status)[0];
   const partnerId = (qsStrings(q.partnerId)[0] ?? qsStrings(q.partner)[0]) || undefined;
   const team = qsStrings(q.team)[0];
   const serviceTypeId = (qsStrings(q.serviceTypeId)[0] ?? qsStrings(q.serviceType)[0]) || undefined;
   const qtext = (qsStrings(q.q)[0] ?? qsStrings(q.search)[0]) || undefined;
 
-  if (status) f.status = normalizeStatus(status);
-  if (partnerId) f.partnerId = partnerId;
-  if (team) f.team = new RegExp(`^${team}$`, "i");
-  if (serviceTypeId) f.serviceTypeId = serviceTypeId;
+  const base: any = {};
+  if (status) base.status = normalizeStatus(status);
+  if (partnerId) base.partnerId = partnerId;
+  if (team) base.team = new RegExp(`^${team}$`, "i");
+  if (serviceTypeId) base.serviceTypeId = serviceTypeId;
 
-  if (qtext) {
-    const rx = new RegExp(String(qtext).trim(), "i");
-    f.$or = [
-      { clientName: rx },
-      { firstName: rx },
-      { lastName: rx },
-      { observations: rx },
-      { "partner.name": rx },
-      { team: rx },
-      { park: rx },
-      { location: rx },
-    ];
-  }
-  return f;
+  // 🔥 IDs sem usar _id: {$in: ...} — evita CastError
+  const rawIds = collectIds(q);
+  const validIds = rawIds.filter(Types.ObjectId.isValid);
+  const idClause = validIds.length ? { $or: validIds.map((id) => ({ _id: id })) } : null;
+
+  // Busca textual
+  const textClause =
+    qtext && String(qtext).trim()
+      ? {
+          $or: [
+            { clientName: new RegExp(String(qtext).trim(), "i") },
+            { firstName: new RegExp(String(qtext).trim(), "i") },
+            { lastName: new RegExp(String(qtext).trim(), "i") },
+            { observations: new RegExp(String(qtext).trim(), "i") },
+            { "partner.name": new RegExp(String(qtext).trim(), "i") },
+            { team: new RegExp(String(qtext).trim(), "i") },
+            { park: new RegExp(String(qtext).trim(), "i") },
+            { location: new RegExp(String(qtext).trim(), "i") },
+          ],
+        }
+      : null;
+
+  // Combinação segura
+  const andParts = [];
+  if (Object.keys(base).length) andParts.push(base);
+  if (idClause) andParts.push(idClause);
+  if (textClause) andParts.push(textClause);
+
+  if (andParts.length === 0) return {}; // sem filtros
+  if (andParts.length === 1) return andParts[0]; // único filtro
+  return { $and: andParts };
 }
 
 /* ========= Payment model (opcional/robusto) ========= */
@@ -130,7 +174,9 @@ async function getFirstPaymentLink(id: string) {
   const doc = await Payment.findOne(
     { serviceIds: { $in: arr } },
     { _id: 1, status: 1, updatedAt: 1, createdAt: 1 }
-  ).sort({ updatedAt: -1, _id: -1 }).lean();
+  )
+    .sort({ updatedAt: -1, _id: -1 })
+    .lean();
   if (!doc) return null;
   return { paymentId: String((doc as any)._id), status: normPaymentStatus((doc as any).status) };
 }
@@ -142,9 +188,15 @@ async function mapPaymentLinksByServiceIds(ids: string[]) {
   const objIds = idsStr.filter(Types.ObjectId.isValid).map((s) => new Types.ObjectId(s));
 
   const [byStr, byObj] = await Promise.all([
-    Payment.find({ serviceIds: { $in: idsStr } }, { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }).lean(),
+    Payment.find(
+      { serviceIds: { $in: idsStr } },
+      { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }
+    ).lean(),
     objIds.length
-      ? Payment.find({ serviceIds: { $in: objIds } }, { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }).lean()
+      ? Payment.find(
+          { serviceIds: { $in: objIds } },
+          { _id: 1, serviceIds: 1, status: 1, updatedAt: 1, createdAt: 1 }
+        ).lean()
       : Promise.resolve([] as any[]),
   ]);
 
@@ -154,7 +206,7 @@ async function mapPaymentLinksByServiceIds(ids: string[]) {
     const pid = String(p._id);
     const ts: number = new Date(p.updatedAt || p.createdAt || Date.now()).getTime();
     const status = normPaymentStatus(p.status);
-    for (const sid of (p.serviceIds || [])) {
+    for (const sid of p.serviceIds || []) {
       const key = String(sid);
       if (!idsSet.has(key)) continue;
       const prev = map.get(key);
@@ -174,19 +226,30 @@ export async function listServices(req: Request, res: Response, next: NextFuncti
     const sort = buildSort(req.query as any);
 
     const [items, total] = await Promise.all([
-      Service.find(filter).collation({ locale: "en", strength: 2 }).sort(sort).skip(skip).limit(pageSize).lean(),
+      Service.find(filter)
+        .collation({ locale: "en", strength: 2 })
+        .sort(sort)
+        .skip(skip)
+        .limit(pageSize)
+        .lean(),
       Service.countDocuments(filter),
     ]);
 
+    // Enriquecimento com link de pagamento — não derruba a rota
     let itemsOut = items as any[];
     try {
       const ids = items.map((it: any) => String(it._id));
       const links = await mapPaymentLinksByServiceIds(ids);
       itemsOut = items.map((it: any) => {
         const link = links.get(String(it._id));
-        return { ...it, paymentId: link?.paymentId ?? null, paymentStatus: link?.status ?? null, isLocked: !!link };
+        return {
+          ...it,
+          paymentId: link?.paymentId ?? null,
+          paymentStatus: link?.status ?? null,
+          isLocked: !!link,
+        };
       });
-    } catch {} // enriquecimento não derruba a lista
+    } catch {}
 
     res.json({
       items: itemsOut,
@@ -196,7 +259,13 @@ export async function listServices(req: Request, res: Response, next: NextFuncti
       page,
       pageSize,
     });
-  } catch (err) {
+  } catch (err: any) {
+    // Retorno amigável se algo escapar
+    if (req.query?.debug) {
+      return res
+        .status(400)
+        .json({ error: "bad_query", detail: String(err?.message || err) });
+    }
     next(err);
   }
 }
@@ -227,13 +296,20 @@ export async function getService(req: Request, res: Response, next: NextFunction
 export async function createService(req: Request, res: Response, next: NextFunction) {
   try {
     const b = req.body || {};
-    const payload: any = { ...b, serviceDate: coerceServiceDate(b.serviceDate) ?? new Date(), status: normalizeStatus(b.status) };
-    delete payload._id; delete payload.id;
+    const payload: any = {
+      ...b,
+      serviceDate: coerceServiceDate(b.serviceDate) ?? new Date(),
+      status: normalizeStatus(b.status),
+    };
+    delete payload._id;
+    delete payload.id;
 
     const created: any = await Service.create(payload);
     const fresh = await Service.findById(String(created?._id)).lean();
 
-    res.status(201).json({ ...(fresh as any), paymentId: null, paymentStatus: null, isLocked: false });
+    res
+      .status(201)
+      .json({ ...(fresh as any), paymentId: null, paymentStatus: null, isLocked: false });
   } catch (err) {
     next(err);
   }
@@ -268,7 +344,8 @@ export async function bulkCreateServices(req: Request, res: Response, next: Next
           serviceDate: coerceServiceDate(b.serviceDate) ?? new Date(),
           status: normalizeStatus(b.status),
         };
-        delete p._id; delete p.id;
+        delete p._id;
+        delete p.id;
 
         const doc: any = await Service.create(p);
         const fresh = await Service.findById(String(doc?._id)).lean();
@@ -280,11 +357,20 @@ export async function bulkCreateServices(req: Request, res: Response, next: Next
 
     if (inserted.length === 0) {
       // nada deu certo → 400 para o front não tentar formatos alternativos e não duplicar
-      return res.status(400).json({ inserted: 0, failed: failed.length, errors: failed });
+      return res
+        .status(400)
+        .json({ inserted: 0, failed: failed.length, errors: failed });
     }
 
     // houve ao menos um sucesso → 201 com resumo
-    return res.status(201).json({ items: inserted, inserted: inserted.length, failed: failed.length, errors: failed });
+    return res
+      .status(201)
+      .json({
+        items: inserted,
+        inserted: inserted.length,
+        failed: failed.length,
+        errors: failed,
+      });
   } catch (err) {
     next(err);
   }
@@ -299,20 +385,36 @@ export async function updateService(req: Request, res: Response, next: NextFunct
     try {
       const link = await getFirstPaymentLink(id);
       if (link) {
-        return res.status(409).json({ error: "locked", message: "Service is linked to a payment and cannot be modified.", paymentId: link.paymentId, paymentStatus: link.status });
+        return res.status(409).json({
+          error: "locked",
+          message: "Service is linked to a payment and cannot be modified.",
+          paymentId: link.paymentId,
+          paymentStatus: link.status,
+        });
       }
     } catch {}
 
     const patch: any = { ...(req.body || {}) };
-    delete patch._id; delete patch.id;
+    delete patch._id;
+    delete patch.id;
     if (patch.status) patch.status = normalizeStatus(patch.status);
-    if (patch.serviceDate !== undefined) patch.serviceDate = coerceServiceDate(patch.serviceDate) ?? undefined;
+    if (patch.serviceDate !== undefined)
+      patch.serviceDate = coerceServiceDate(patch.serviceDate) ?? undefined;
 
-    const updated = await Service.findByIdAndUpdate(id, { $set: patch }, { new: true, runValidators: true, upsert: false })
-      .collation({ locale: "en", strength: 2 });
+    const updated = await Service.findByIdAndUpdate(
+      id,
+      { $set: patch },
+      { new: true, runValidators: true, upsert: false }
+    ).collation({ locale: "en", strength: 2 });
+
     if (!updated) return res.status(404).json({ error: "Not found" });
 
-    res.json({ ...(updated.toObject() as any), paymentId: null, paymentStatus: null, isLocked: false });
+    res.json({
+      ...(updated.toObject() as any),
+      paymentId: null,
+      paymentStatus: null,
+      isLocked: false,
+    });
   } catch (err) {
     next(err);
   }
@@ -353,23 +455,39 @@ function parseIdsFromReq(req: Request): string[] {
   const qIds = (req.query as any).ids;
   if (Array.isArray(qIds)) {
     qIds.forEach((v) =>
-      String(v).split(",").map((s) => s.trim()).filter(Boolean).forEach((id) => out.add(id))
+      String(v)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .forEach((id) => out.add(id))
     );
   } else if (qIds) {
-    String(qIds).split(",").map((s) => s.trim()).filter(Boolean).forEach((id) => out.add(id));
+    String(qIds)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .forEach((id) => out.add(id));
   }
 
   // ?ids[]=a&ids[]=b
   const qIdsArray = (req.query as any)["ids[]"];
   if (Array.isArray(qIdsArray)) {
-    qIdsArray.map((s) => String(s).trim()).filter(Boolean).forEach((id) => out.add(id));
+    qIdsArray
+      .map((s) => String(s).trim())
+      .filter(Boolean)
+      .forEach((id) => out.add(id));
   } else if (qIdsArray) {
     out.add(String(qIdsArray).trim());
   }
 
   // body { ids: [...] }
-  const bodyIds = Array.isArray((req.body as any)?.ids) ? (req.body as any).ids : [];
-  bodyIds.map((s: any) => String(s).trim()).filter(Boolean).forEach((id: string) => out.add(id));
+  const bodyIds = Array.isArray((req.body as any)?.ids)
+    ? (req.body as any).ids
+    : [];
+  bodyIds
+    .map((s: any) => String(s).trim())
+    .filter(Boolean)
+    .forEach((id: string) => out.add(id));
 
   return Array.from(out).filter(isObjectId);
 }
@@ -390,7 +508,11 @@ export async function deleteManyServices(req: Request, res: Response, next: Next
           Payment.find({ serviceIds: { $in: ids } }, { serviceIds: 1 }).lean(),
           Payment.find({ serviceIds: { $in: objIds } }, { serviceIds: 1 }).lean(),
         ]);
-        [...byStr, ...byObj].forEach((p: any) => (p.serviceIds || []).forEach((sid: any) => linkedSet.add(String(sid))));
+        [...byStr, ...byObj].forEach((p: any) =>
+          (p.serviceIds || []).forEach((sid: any) =>
+            linkedSet.add(String(sid))
+          )
+        );
       } catch {
         linkedSet = new Set(); // degrade
       }
