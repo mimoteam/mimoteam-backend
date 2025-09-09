@@ -24,50 +24,30 @@ async function recalcTotal(paymentId: string) {
 
 /** -------- service-status -------- */
 router.get('/service-status', async (req, res) => {
-  try {
-    const raw = (req.query as any).ids;
-    let ids: string[] = [];
+  const idsParam = String(req.query.ids || '').trim();
+  const ids = idsParam ? idsParam.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (!ids.length) return res.status(400).json({ error: 'Missing ids' });
 
-    if (Array.isArray(raw)) {
-      ids = raw.flatMap((v: any) => String(v ?? '').split(','));
-    } else if (typeof raw === 'string') {
-      ids = raw.split(',');
-    }
+const orConds = ids.map(id => ({ serviceIds: id }));
+const rows = await Payment.find(
+  { $or: orConds },
+  { _id: 1, serviceIds: 1 }
+).lean();
 
-    ids = ids.map((s) => s.trim()).filter(Boolean);
-    const validIds = Array.from(new Set(ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s))));
+  const index = new Map<string, string>();
+  rows.forEach((p: any) => (p.serviceIds || []).forEach((sid: any) => {
+    const s = String(sid);
+    if (!index.has(s)) index.set(s, String(p._id));
+  }));
 
-    if (!ids.length) return res.status(400).json({ error: 'Missing ids' });
+  const items: Record<string, { inPayment: boolean; paymentId: string | null }> = {};
+  ids.forEach((id) => {
+  const payment = rows.find((p: any) => (p.serviceIds || []).some((sid: any) => String(sid) === id));
+  const paymentId = payment ? String(payment._id) : null;
+  items[id] = { inPayment: !!paymentId, paymentId };
+});
 
-    // default para todos (até inválidos) -> null
-    const result: Record<string, { inPayment: boolean; paymentId: string | null } | null> = {};
-    ids.forEach((id) => (result[id] = null));
-
-    if (validIds.length) {
-      // Evita $in (que está causando CastError no teu schema); usa OR de igualdades
-      const clauses = validIds.map((id) => ({ serviceIds: id }));
-      const rows = await Payment.find(
-        clauses.length ? { $or: clauses } : { _id: null },
-        { _id: 1, serviceIds: 1 }
-      ).lean();
-
-      const index = new Map<string, string>();
-      rows.forEach((p: any) => (p.serviceIds || []).forEach((sid: any) => {
-        const s = String(sid);
-        if (!index.has(s)) index.set(s, String(p._id));
-      }));
-
-      validIds.forEach((id) => {
-        const paymentId = index.get(id) || null;
-        result[id] = { inPayment: !!paymentId, paymentId };
-      });
-    }
-
-    return res.json({ items: result });
-  } catch (err) {
-    console.error('[payments] /service-status error', err);
-    return res.status(500).json({ error: 'Internal error' });
-  }
+  return res.json({ items });
 });
 /** -------------------------------- */
 
