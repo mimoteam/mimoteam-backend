@@ -1,25 +1,43 @@
 // src/config/env.ts
-import dotenv from "dotenv";
+import "dotenv/config";
 
-// Carrega .env da raiz do projeto (onde está seu package.json)
-dotenv.config();
-
-function req(name: string, fallback = "") {
-  const v = process.env[name];
-  return (v && v.trim()) || fallback;
+function bool(v: any, def = false) {
+  if (v === undefined || v === null || v === "") return def;
+  const s = String(v).trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on"].includes(s);
+}
+function num(v: any, def: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
 }
 
 export const env = {
-  NODE_ENV: req("NODE_ENV", "development"),
-  PORT: req("PORT", "4000"),
-  MONGODB_URI: req("MONGODB_URI", ""),
-  JWT_SECRET: req("JWT_SECRET", ""),     // <- importante!
-  CORS_ORIGIN: req("CORS_ORIGIN", ""),
-};
+  NODE_ENV: process.env.NODE_ENV || "development",
+  get isProd() {
+    return (process.env.NODE_ENV || "development") === "production";
+  },
 
-// Pequeno log defensivo para confirmar em runtime
-if (!env.JWT_SECRET) {
-  console.warn("[env] ATENÇÃO: JWT_SECRET não definido!");
-} else {
-  console.log("[env] JWT_SECRET prefix:", env.JWT_SECRET.slice(0, 8));
-}
+  PORT: num(process.env.PORT, 4000),
+
+  // Mongo
+  MONGO_URI:
+    process.env.MONGO_URI ||
+    process.env.MONGODB_URI ||
+    "mongodb://localhost:27017",
+  DB_NAME:
+    process.env.DB_NAME ||
+    process.env.MONGO_DB ||
+    process.env.MONGODB_DB ||
+    "mimoteam",
+
+  ENABLE_MONGOOSE_DEBUG: bool(process.env.ENABLE_MONGOOSE_DEBUG, false),
+
+  // Auth
+  JWT_SECRET: process.env.JWT_SECRET || "dev-only-secret",
+
+  // CORS
+  CORS_ORIGIN: process.env.CORS_ORIGIN || "http://localhost:5173",
+} as const;
+
+// compat para imports antigos: import { isProd } from './env'
+export const isProd = env.isProd;
