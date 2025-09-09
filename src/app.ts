@@ -14,8 +14,8 @@ import costRoutes from "./costs/cost.routes";
 import paymentRoutes from "./payments/payment.routes";
 import availabilityRoutes from "./availability/availability.routes";
 import uploadRoutes from "./upload/upload.routes";
-import taskRoutes from "./tasks/task.routes";
-import handoverRoutes from "./handover/handover.routes";
+// import taskRoutes from "./tasks/task.routes";
+// import handoverRoutes from "./handover/handover.routes";
 import statusRoutes from "./status/status.routes";
 
 import { ensureUploadDirs, ROOT_UPLOADS } from "./config/uploads";
@@ -176,9 +176,7 @@ mirror(["/availability", "/api/availability"], availabilityRoutes);
 mirror(["/upload", "/api/upload"], uploadRoutes);
 mirror(["/status", "/api/status"], statusRoutes);
 
-/* ===== Rotas admin ===== */
-mirror(["/tasks", "/api/tasks"], auth("admin"), taskRoutes);
-mirror(["/handover", "/api/handover"], auth("admin"), handoverRoutes);
+
 
 /* ✅ Lightning Lane (router cuida do auth por rota) */
 app.use("/lanes", lanesRouter);
@@ -189,6 +187,16 @@ if (debugRoutes) {
   app.use("/api", debugRoutes);
 }
 
+
+// ---- NOOP stubs: tasks & handover desativados, mas o front ainda chama ----
+const noopListHandler = (req, res) => {
+  const page = Number((req.query?.page) || "1");
+  const pageSize = Number((req.query?.pageSize) || "50");
+  res.json({ items: [], total: 0, page, pageSize, totalPages: 0 });
+};
+["/api/tasks","/tasks","/admin/tasks","/dashboard/tasks"].forEach(p=>app.get(p, noopListHandler));
+["/api/handover","/handover","/api/handover-notes","/handover-notes","/api/shift-handover","/shift-handover"].forEach(p=>app.get(p, noopListHandler));
+// ---------------------------------------------------------------------------
 /* ===== 404 + erro ===== */
 app.use(notFound);
 app.use(errorHandler);
