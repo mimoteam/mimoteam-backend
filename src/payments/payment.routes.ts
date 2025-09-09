@@ -1,208 +1,407 @@
-import { Router } from 'express';
-import Payment from './payment.model';
-import { Service } from '../services/service.model';
+// src/payments/payment.routes.ts
+import { Router, type Request, type Response, type NextFunction } from "express";
+import mongoose from "mongoose";
+import PaymentModel from "./payment.model";
+import UserModel from "../users/user.model";
 
+type AnyDoc = Record<string, any>;
 const router = Router();
 
-const normalizePayment = (d: any) => {
-  const { _id, serviceIds, ...rest } = d;
-  return {
-    id: String(_id),
-    ...rest,
-    serviceIds: Array.isArray(serviceIds) ? serviceIds.map((x: any) => String(x)) : [],
-  };
-};
+/* ── util: wrapper anti-unhandled-rejection ─────────────────── */
+const ah =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<any>) =>
+  (req: Request, res: Response, next: NextFunction) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
 
-async function recalcTotal(paymentId: string) {
-  const p = await Payment.findById(paymentId).lean();
-  if (!p) return null;
-  const services = await Service.find({ _id: { $in: p.serviceIds } }, { finalValue: 1 }).lean();
-  const total = services.reduce((acc, s: any) => acc + Number(s.finalValue || 0), 0);
-  await Payment.findByIdAndUpdate(paymentId, { $set: { total } });
-  return total;
+/* ── util: paginação/ordenacao ──────────────────────────────── */
+function getPage(req: Request) {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(500, Math.max(1, Number(req.query.pageSize || 50)));
+  const skip = (page - 1) * pageSize;
+  return { page, pageSize, skip, limit: pageSize };
 }
 
-/** -------- service-status -------- */
-router.get('/service-status', async (req, res) => {
-  const idsParam = String(req.query.ids || '').trim();
-  const ids = idsParam ? idsParam.split(',').map(s => s.trim()).filter(Boolean) : [];
-  if (!ids.length) return res.status(400).json({ error: 'Missing ids' });
+function getSort(req: Request) {
+  const sortBy = String(req.query.sortBy || "_id");
+  const dir = String(req.query.sortDir || "desc").toLowerCase() === "asc" ? 1 : -1;
+  return { [sortBy]: dir } as AnyDoc;
+}
 
-const orConds = ids.map(id => ({ serviceIds: id }));
-const rows = await Payment.find(
-  { $or: orConds },
-  { _id: 1, serviceIds: 1 }
-).lean();
+/* ── util: filtro simples (partner/status/intervalo) ────────── */
+function buildFilter(req: Request) {
+  const q: AnyDoc = {};
+  const partnerId = (req.query.partnerId || req.query.partner) as string | undefined;
+  const status = req.query.status as string | undefined;
 
-  const index = new Map<string, string>();
-  rows.forEach((p: any) => (p.serviceIds || []).forEach((sid: any) => {
-    const s = String(sid);
-    if (!index.has(s)) index.set(s, String(p._id));
-  }));
+  if (partnerId) q.partnerId = String(partnerId);
+  if (status) q.status = String(status);
 
-  const items: Record<string, { inPayment: boolean; paymentId: string | null }> = {};
-  ids.forEach((id) => {
-  const payment = rows.find((p: any) => (p.serviceIds || []).some((sid: any) => String(sid) === id));
-  const paymentId = payment ? String(payment._id) : null;
-  items[id] = { inPayment: !!paymentId, paymentId };
-});
-
-  return res.json({ items });
-});
-/** -------------------------------- */
-
-/** LIST */
-router.get('/', async (req, res) => {
-  const { page = '1', pageSize = '10', limit, offset, partnerId, status } =
-    req.query as Record<string, string | undefined>;
-
-  const _page = Number(page) || (offset ? Math.floor(Number(offset) / Number(limit)) + 1 : 1);
-  const _pageSize = Number(pageSize) || Number(limit) || 10;
-  const skip = (_page - 1) * _pageSize;
-
-  const filter: Record<string, any> = {};
-  if (partnerId) filter.partnerId = partnerId;
-  if (status) filter.status = status;
-
-  const [docs, total] = await Promise.all([
-    Payment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(_pageSize).lean(),
-    Payment.countDocuments(filter),
-  ]);
-
-  const items = (docs as any[]).map(normalizePayment);
-
-  res.json({
-    items,
-    total,
-    page: _page,
-    pageSize: _pageSize,
-    totalPages: Math.max(1, Math.ceil(total / _pageSize)),
-  });
-});
-
-/** CREATE */
-router.post('/', async (req, res) => {
-  const payload = {
-    partnerId: req.body.partnerId,
-    partnerName: req.body.partnerName || '',
-    weekKey: req.body.weekKey ?? null,
-    weekStart: req.body.weekStart ?? null,
-    weekEnd: req.body.weekEnd ?? null,
-    periodFrom: req.body.periodFrom ?? null,
-    periodTo: req.body.periodTo ?? null,
-    serviceIds: Array.isArray(req.body.serviceIds) ? req.body.serviceIds.map(String) : [],
-    extraIds: Array.isArray(req.body.extraIds) ? req.body.extraIds.map(String) : [],
-    status: req.body.status || 'PENDING',
-    notes: req.body.notes || '',
-    notesLog: Array.isArray(req.body.notesLog) ? req.body.notesLog : [],
-  };
-  const created = await Payment.create(payload);
-  await recalcTotal(String(created._id));
-  res.status(201).json(normalizePayment(created.toObject() as any));
-});
-
-/** UPDATE */
-router.patch('/:id', async (req, res) => {
-  const { id } = req.params;
-  const patch: any = { ...req.body };
-  if (Array.isArray(patch.serviceIds)) patch.serviceIds = patch.serviceIds.map(String);
-  if (Array.isArray(patch.extraIds)) patch.extraIds = patch.extraIds.map(String);
-
-  const updated = await Payment.findByIdAndUpdate(id, { $set: patch }, { new: true }).lean();
-  if (!updated) return res.status(404).json({ error: 'Not found' });
-
-  if ('serviceIds' in patch) await recalcTotal(id);
-  res.json(normalizePayment(updated as any));
-});
-
-/** DELETE */
-router.delete('/:id', async (req, res) => {
-  const { id } = req.params;
-  const del = await Payment.findByIdAndDelete(id);
-  if (!del) return res.status(404).json({ error: 'Not found' });
-  res.json({ ok: true });
-});
-
-/** eligible */
-router.get('/eligible', async (req, res) => {
-  const partnerId = String((req.query as any).partner || '');
-  const dateFrom = (req.query as any).dateFrom ? new Date(String((req.query as any).dateFrom)) : null;
-  const dateTo = (req.query as any).dateTo ? new Date(String((req.query as any).dateTo)) : null;
-  const serviceType = String((req.query as any).serviceType || 'REIMBURSEMENT');
-
-  if (!partnerId) return res.status(400).json({ error: 'Missing partner' });
-
-  const periodFilter: any = {};
-  if (dateFrom) periodFilter.$gte = dateFrom;
-  if (dateTo) {
-    const end = new Date(dateTo);
-    end.setHours(23, 59, 59, 999);
-    periodFilter.$lte = end;
+  // datas aceitando from/to ou dateFrom/dateTo
+  const from = (req.query.from || req.query.dateFrom) as string | undefined;
+  const to   = (req.query.to   || req.query.dateTo)   as string | undefined;
+  if (from || to) {
+    const gte = from ? new Date(from) : undefined;
+    const lte = to   ? new Date(to)   : undefined;
+    // cobre period* ou week* conforme existir
+    q.$or = [
+      {
+        periodFrom: { ...(gte ? { $lte: lte ?? new Date("9999-12-31") } : {}) },
+        periodTo:   { ...(lte ? { $gte: gte ?? new Date("0001-01-01") } : {}) },
+      },
+      {
+        weekStart:  { ...(gte ? { $lte: lte ?? new Date("9999-12-31") } : {}) },
+        weekEnd:    { ...(lte ? { $gte: gte ?? new Date("0001-01-01") } : {}) },
+      },
+    ];
   }
 
-  const payments = await Payment.find({ partnerId }, { serviceIds: 1 }).lean();
-  const usedIds = new Set<string>();
-  payments.forEach((p) => (p.serviceIds || []).forEach((sid: any) => usedIds.add(String(sid))));
+  return q;
+}
 
-  const filter: any = { partnerId };
-  if (Object.keys(periodFilter).length) filter.serviceDate = periodFilter;
-  if (serviceType !== 'ALL') filter.serviceTypeId = serviceType;
+/* ── DIAGNÓSTICO ────────────────────────────────────────────── */
+router.get(
+  "/__diag",
+  ah(async (_req, res) => {
+    const state = mongoose.connection.readyState; // 1=connected
+    let count = 0;
+    try {
+      count = await PaymentModel.estimatedDocumentCount().maxTimeMS(3000);
+    } catch {}
+    res.json({
+      ok: true,
+      mongoose: state,
+      count,
+      time: new Date().toISOString(),
+      model: "Payment",
+      note: "se isso responde, o router está montado e o db alcançável",
+    });
+  })
+);
 
-  const services = await Service.find(filter).sort({ serviceDate: -1 }).lean();
-  const items = services
-    .filter((s) => !usedIds.has(String(s._id)))
-    .map((s) => ({
-      id: String(s._id),
-      serviceDate: s.serviceDate,
-      firstName: s.firstName || '',
-      lastName: s.lastName || '',
-      serviceTypeId: s.serviceTypeId || '',
-      finalValue: Number(s.finalValue || 0),
-      observations: s.observations || '',
-    }));
+/* ── SERVICE → STATUS (declarado ANTES de '/:id') ───────────── */
+router.get(
+  "/service-status",
+  ah(async (req, res) => {
+    try {
+      const idsParam = String(req.query.ids || "");
+      const requested = idsParam
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
 
-  res.json({ items, total: items.length });
-});
+      if (requested.length === 0) return res.json({ items: [] });
 
-/** itens: add */
-router.post('/:id/items', async (req, res) => {
-  const { id } = req.params;
-  const { serviceId } = req.body || {};
-  if (!serviceId) return res.status(400).json({ error: 'Missing serviceId' });
+      // partner guard (partner só enxerga os dele)
+      const user = (req as any).user;
+      const baseFilter: AnyDoc = {};
+      if (user?.role?.toLowerCase() === "partner") {
+        baseFilter.partnerId = String(user.id || user._id);
+      }
 
-  const pay = await Payment.findById(id);
-  if (!pay) return res.status(404).json({ error: 'Payment not found' });
+      // buscamos pagamentos (sem filtrar por serviceIds no Mongo para evitar CastError)
+      const proj: AnyDoc = {
+        _id: 1,
+        status: 1,
+        serviceIds: 1,
+        items: 1,
+        services: 1,
+      };
 
-  const svc = await Service.findById(serviceId).lean();
-  if (!svc) return res.status(404).json({ error: 'Service not found' });
-  if (String((svc as any).partnerId || (svc as any).partner?.id || '') !== String((pay as any).partnerId)) {
-    return res.status(400).json({ error: 'Service partner mismatch' });
-  }
+      const docs = await PaymentModel.find(baseFilter, proj)
+        .lean()
+        .maxTimeMS(8000);
 
-  const has = (pay.serviceIds as any[]).some((s: any) => String(s) === String(serviceId));
-  if (!has) {
-    (pay.serviceIds as any[]).push(String(serviceId));
-    await pay.save();
-    await recalcTotal(id);
-  }
+      const wanted = new Set(requested.map(String));
+      const items: Array<{ serviceId: string; paymentId: string; status: string }> = [];
 
-  res.json(normalizePayment(pay.toObject() as any));
-});
+      const pushMaybe = (acc: Set<string>, anyVal: any) => {
+        const s = String(
+          anyVal?._id ??
+            anyVal?.id ??
+            anyVal?.service ??
+            anyVal?.serviceId ??
+            anyVal ??
+            ""
+        );
+        if (s) acc.add(s);
+      };
 
-/** itens: remove */
-router.delete('/:id/items/:serviceId', async (req, res) => {
-  const { id, serviceId } = req.params;
-  const pay = await Payment.findById(id);
-  if (!pay) return res.status(404).json({ error: 'Payment not found' });
+      for (const p of docs as AnyDoc[]) {
+        const found = new Set<string>();
 
-  const next = (pay.serviceIds as any[]).filter((s: any) => String(s) !== String(serviceId));
-  if (next.length !== (pay.serviceIds as any[]).length) {
-    (pay.serviceIds as any[]) = next;
-    await pay.save();
-    await recalcTotal(id);
-  }
+        if (Array.isArray(p.serviceIds)) {
+          for (const sid of p.serviceIds) pushMaybe(found, sid);
+        }
+        if (Array.isArray(p.items)) {
+          for (const it of p.items) pushMaybe(found, it);
+        }
+        if (Array.isArray(p.services)) {
+          for (const sv of p.services) pushMaybe(found, sv);
+        }
 
-  res.json(normalizePayment(pay.toObject() as any));
-});
+        for (const sid of found) {
+          if (wanted.has(sid)) {
+            items.push({
+              serviceId: sid,
+              paymentId: String(p._id),
+              status: String(p.status || "PENDING"),
+            });
+          }
+        }
+      }
+
+      return res.json({ items });
+    } catch (e) {
+      console.error("[payments][service-status] error:", e);
+      return res.status(500).json({ ok: false, error: "internal_error" });
+    }
+  })
+);
+
+/* ── (opcional) eligible stub para não conflitar com '/:id' ─── */
+router.get(
+  "/eligible",
+  ah(async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const pageSize = Number(req.query.pageSize || 50);
+    res.json({ items: [], total: 0, page, pageSize, totalPages: 0 });
+  })
+);
+
+/* ── LIST ───────────────────────────────────────────────────── */
+router.get(
+  "/",
+  ah(async (req, res) => {
+    res.setTimeout(12000);
+
+    const { page, pageSize, skip, limit } = getPage(req);
+    const sort = getSort(req);
+    const filter = buildFilter(req);
+
+    // parceiro só enxerga os próprios pagamentos
+    const user = (req as any).user;
+    if (user?.role?.toLowerCase() === "partner") {
+      filter.partnerId = String(user.id || user._id);
+    }
+
+    const proj: AnyDoc = {
+      _id: 1,
+      status: 1,
+      partnerId: 1,
+      partnerName: 1, // se existir no schema
+      periodFrom: 1,
+      periodTo: 1,
+      weekStart: 1,
+      weekEnd: 1,
+      serviceIds: 1,
+      total: 1,          // ← total canônico
+      totalAmount: 1,    // ← compat legado
+      notes: 1,
+      notesLog: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+
+    const [items, total] = await Promise.all([
+      PaymentModel.find(filter, proj).sort(sort).skip(skip).limit(limit).lean().maxTimeMS(8000),
+      PaymentModel.countDocuments(filter).maxTimeMS(5000),
+    ]);
+
+    // Normalização conservadora (sem alterar schema):
+    const normalized = items.map((p: AnyDoc) => {
+      const id = String(p._id);
+      const totalValue =
+        (typeof p.total === "number" ? p.total : undefined) ??
+        (typeof p.totalAmount === "number" ? p.totalAmount : 0);
+
+      const partnerName =
+        p.partnerName || p?.partner?.name || p?.partner?.fullName || "";
+
+      return {
+        ...p,
+        id,
+        partnerName,
+        total: totalValue,
+        serviceIds: Array.isArray(p.serviceIds) ? p.serviceIds.map((s: any) => String(s)) : [],
+      };
+    });
+
+    res.json({
+      items: normalized,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize),
+    });
+  })
+);
+
+/* ── GET ONE ─────────────────────────────────────────────────── */
+router.get(
+  "/:id",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const row = await PaymentModel.findById(id).lean().maxTimeMS(6000);
+    if (!row) return res.status(404).json({ message: "Payment not found" });
+
+    const user = (req as any).user;
+    if (user?.role?.toLowerCase() === "partner" && String(row.partnerId) !== String(user.id || user._id)) {
+      return res.status(404).json({ message: "Payment not found" });
+    }
+
+    (row as AnyDoc).id = String((row as AnyDoc)._id);
+    if (!(row as AnyDoc).partnerName) {
+      (row as AnyDoc).partnerName = (row as AnyDoc).partner?.name || (row as AnyDoc).partner?.fullName || "";
+    }
+    if (typeof (row as AnyDoc).total !== "number") {
+      (row as AnyDoc).total = typeof (row as AnyDoc).totalAmount === "number" ? (row as AnyDoc).totalAmount : 0;
+    }
+
+    return res.json(row);
+  })
+);
+
+/* ── CREATE ──────────────────────────────────────────────────── */
+router.post(
+  "/",
+  ah(async (req, res) => {
+    const body = req.body || {};
+
+    const data: AnyDoc = {
+      partnerId: body.partnerId || body.partner || null,
+      periodFrom: body.periodFrom || body.weekStart || null,
+      periodTo: body.periodTo || body.weekEnd || null,
+      weekStart: body.weekStart || null,
+      weekEnd: body.weekEnd || null,
+      serviceIds: Array.isArray(body.serviceIds)
+        ? body.serviceIds.map(String)
+        : [],
+      // total canônico (aceita legado totalAmount)
+      total: typeof body.total === "number" ? body.total
+           : (typeof body.totalAmount === "number" ? body.totalAmount : 0),
+      notes: body.notes ?? "",
+    };
+
+    // Só seta status se veio e normaliza para UPPERCASE; senão deixa o default do schema
+    if (typeof body.status === "string" && body.status.trim()) {
+      data.status = String(body.status).trim().toUpperCase();
+    }
+
+    // Best-effort: preencher partnerName na criação
+    if (data.partnerId) {
+      try {
+        const u = await UserModel.findById(String(data.partnerId), { fullName: 1, name: 1 }).lean();
+        data.partnerName = u?.fullName || "";
+      } catch {}
+    }
+
+    const created = await PaymentModel.create(data);
+    res.status(201).json({ ...created.toObject(), id: String(created._id) });
+  })
+);
+
+/* ── UPDATE ──────────────────────────────────────────────────── */
+router.patch(
+  "/:id",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const user = (req as any).user;
+
+    // parceiro só pode atualizar os seus
+    const guard = user?.role?.toLowerCase() === "partner" ? { _id: id, partnerId: String(user.id || user._id) } : { _id: id };
+
+    const upd: AnyDoc = { ...req.body };
+    if (upd.appendNote && upd.notes) {
+      const note = { id: new Date().getTime().toString(36), at: new Date().toISOString(), text: String(upd.notes) };
+      delete upd.appendNote;
+      upd.$push = { ...(upd.$push || {}), notesLog: note };
+    }
+
+    const row = await PaymentModel.findOneAndUpdate(guard, upd, { new: true, runValidators: false })
+      .lean()
+      .maxTimeMS(6000);
+
+    if (!row) return res.status(404).json({ message: "Payment not found" });
+    (row as AnyDoc).id = String(row._id);
+    // pós-update: garantir consistência nos campos exibidos pelo front (opcional, mas seguro)
+    if (!(row as AnyDoc).partnerName) {
+      (row as AnyDoc).partnerName = (row as AnyDoc).partner?.name || (row as AnyDoc).partner?.fullName || "";
+    }
+    if (typeof (row as AnyDoc).total !== "number") {
+      (row as AnyDoc).total = typeof (row as AnyDoc).totalAmount === "number" ? (row as AnyDoc).totalAmount : 0;
+    }
+    res.json(row);
+  })
+);
+
+/* ── ADD service → payment ───────────────────────────────────── */
+router.post(
+  "/:id/items",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const serviceId = String(req.body?.serviceId || "");
+    if (!serviceId) return res.status(400).json({ message: "serviceId obrigatório" });
+
+    const user = (req as any).user;
+    const guard = user?.role?.toLowerCase() === "partner" ? { _id: id, partnerId: String(user.id || user._id) } : { _id: id };
+
+    const row = await PaymentModel.findOneAndUpdate(
+      guard,
+      { $addToSet: { serviceIds: serviceId } },
+      { new: true }
+    ).lean().maxTimeMS(6000);
+
+    if (!row) return res.status(404).json({ message: "Payment not found" });
+    (row as AnyDoc).id = String(row._id);
+    res.json(row);
+  })
+);
+
+/* ── REMOVE service de payment ───────────────────────────────── */
+router.delete(
+  "/:id/items/:serviceId",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const serviceId = String(req.params.serviceId);
+
+    const user = (req as any).user;
+    const guard = user?.role?.toLowerCase() === "partner" ? { _id: id, partnerId: String(user.id || user._id) } : { _id: id };
+
+    const row = await PaymentModel.findOneAndUpdate(
+      guard,
+      { $pull: { serviceIds: serviceId } },
+      { new: true }
+    ).lean().maxTimeMS(6000);
+
+    if (!row) return res.status(404).json({ message: "Payment not found" });
+    (row as AnyDoc).id = String(row._id);
+    res.json(row);
+  })
+);
+
+/* ── RECALC stub ─────────────────────────────────────────────── */
+router.post(
+  "/:id/recalc",
+  ah(async (_req, res) => {
+    res.json({ ok: true, message: "recalc stub (implementar se necessário)" });
+  })
+);
+
+/* — DELETE payment — */
+router.delete(
+  "/:id",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const user = (req as any).user;
+    const guard = user?.role?.toLowerCase() === "partner"
+      ? { _id: id, partnerId: String(user.id || user._id) }
+      : { _id: id };
+
+    const del = await PaymentModel.findOneAndDelete(guard).lean().maxTimeMS(6000);
+    if (!del) return res.status(404).json({ message: "Payment not found" });
+    return res.json({ ok: true });
+  })
+);
 
 export default router;
+export { router };
