@@ -1,4 +1,5 @@
 import express from "express";
+import type { Request, Response, RequestHandler } from "express";
 import cors, { type CorsOptions } from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -14,8 +15,8 @@ import costRoutes from "./costs/cost.routes";
 import paymentRoutes from "./payments/payment.routes";
 import availabilityRoutes from "./availability/availability.routes";
 import uploadRoutes from "./upload/upload.routes";
-import taskRoutes from "./tasks/task.routes";
-import handoverRoutes from "./handover/handover.routes";
+// import taskRoutes from "./tasks/task.routes";
+// import handoverRoutes from "./handover/handover.routes";
 import statusRoutes from "./status/status.routes";
 
 import { ensureUploadDirs, ROOT_UPLOADS } from "./config/uploads";
@@ -88,7 +89,10 @@ const corsOptions: CorsOptions = {
   origin(origin, cb) {
     if (!origin) return cb(null, true); // curl / health checks
     if (allowed.has(origin)) return cb(null, true);
-    if (process.env.NODE_ENV !== "production" && /^http:\/\/localhost:\d+$/i.test(origin)) {
+    if (
+      process.env.NODE_ENV !== "production" &&
+      /^http:\/\/localhost:\d+$/i.test(origin)
+    ) {
       return cb(null, true);
     }
     return cb(new Error(`Not allowed by CORS: ${origin}`));
@@ -139,7 +143,10 @@ app.use((req, _res, next) => {
     console.log("[DEBUG][REQ]", req.method, req.originalUrl);
     console.log("[DEBUG][QUERY]", req.query);
     if (req.method === "OPTIONS") {
-      console.log("[DEBUG][PREFLIGHT] ACRH =", req.header("Access-Control-Request-Headers"));
+      console.log(
+        "[DEBUG][PREFLIGHT] ACRH =",
+        req.header("Access-Control-Request-Headers")
+      );
     }
   }
   next();
@@ -176,10 +183,6 @@ mirror(["/availability", "/api/availability"], availabilityRoutes);
 mirror(["/upload", "/api/upload"], uploadRoutes);
 mirror(["/status", "/api/status"], statusRoutes);
 
-/* ===== Rotas admin ===== */
-mirror(["/tasks", "/api/tasks"], auth("admin"), taskRoutes);
-mirror(["/handover", "/api/handover"], auth("admin"), handoverRoutes);
-
 /* ✅ Lightning Lane (router cuida do auth por rota) */
 app.use("/lanes", lanesRouter);
 app.use("/api/lanes", lanesRouter);
@@ -188,6 +191,27 @@ app.use("/api/lanes", lanesRouter);
 if (debugRoutes) {
   app.use("/api", debugRoutes);
 }
+
+// ---- NOOP stubs: tasks & handover desativados, mas o front ainda chama ----
+const noopListHandler: RequestHandler = (req: Request, res: Response) => {
+  const page = Number((req.query?.page as string) || "1");
+  const pageSize = Number((req.query?.pageSize as string) || "50");
+  res.json({ items: [], total: 0, page, pageSize, totalPages: 0 });
+};
+
+["/api/tasks", "/tasks", "/admin/tasks", "/dashboard/tasks"].forEach((p) =>
+  app.get(p, noopListHandler)
+);
+
+[
+  "/api/handover",
+  "/handover",
+  "/api/handover-notes",
+  "/handover-notes",
+  "/api/shift-handover",
+  "/shift-handover",
+].forEach((p) => app.get(p, noopListHandler));
+// ---------------------------------------------------------------------------
 
 /* ===== 404 + erro ===== */
 app.use(notFound);
