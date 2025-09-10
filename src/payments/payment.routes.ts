@@ -16,7 +16,8 @@ const ah =
 /* ── util: paginação/ordenacao ──────────────────────────────── */
 function getPage(req: Request) {
   const page = Math.max(1, Number(req.query.page || 1));
-  const pageSize = Math.min(500, Math.max(1, Number(req.query.pageSize || 50)));
+  // leve aumento no default/teto, mas ainda conservador
+  const pageSize = Math.min(5000, Math.max(1, Number(req.query.pageSize || 500)));
   const skip = (page - 1) * pageSize;
   return { page, pageSize, skip, limit: pageSize };
 }
@@ -181,7 +182,7 @@ router.get(
     // parceiro só enxerga os próprios pagamentos
     const user = (req as any).user;
     if (user?.role?.toLowerCase() === "partner") {
-      filter.partnerId = String(user.id || user._id);
+      (filter as AnyDoc).partnerId = String(user.id || user._id);
     }
 
     const proj: AnyDoc = {
@@ -194,44 +195,69 @@ router.get(
       weekStart: 1,
       weekEnd: 1,
       serviceIds: 1,
-      total: 1,          // ← total canônico
-      totalAmount: 1,    // ← compat legado
+      items: 1,        // ← inclui campos legados
+      services: 1,     // ← inclui campos legados
+      total: 1,        // canônico
+      totalAmount: 1,  // compat legado
       notes: 1,
       notesLog: 1,
       createdAt: 1,
       updatedAt: 1,
     };
 
-    const [items, total] = await Promise.all([
-      PaymentModel.find(filter, proj).sort(sort).skip(skip).limit(limit).lean().maxTimeMS(8000),
-      PaymentModel.countDocuments(filter).maxTimeMS(5000),
-    ]);
+    // all=1 → sem paginação (para FinanceCenter enxergar tudo)
+    const allParam = String((req.query as any).all || "").toLowerCase();
+    const wantAll = allParam === "1" || allParam === "true" || allParam === "yes";
 
-    // Normalização conservadora (sem alterar schema):
-    const normalized = items.map((p: AnyDoc) => {
+    const query = PaymentModel.find(filter as AnyDoc, proj).sort(sort as AnyDoc);
+    if (!wantAll) query.skip(skip).limit(limit);
+
+    const itemsRaw = await query.lean().maxTimeMS(8000);
+    const total = wantAll
+      ? (Array.isArray(itemsRaw) ? itemsRaw.length : 0)
+      : await PaymentModel.countDocuments(filter as AnyDoc).maxTimeMS(5000);
+
+    // Normalização conservadora (e união de serviceIds com legados)
+    const normalized = (Array.isArray(itemsRaw) ? itemsRaw : []).map((p: AnyDoc) => {
       const id = String(p._id);
+
+      // total
       const totalValue =
         (typeof p.total === "number" ? p.total : undefined) ??
         (typeof p.totalAmount === "number" ? p.totalAmount : 0);
 
+      // partnerName fallback
       const partnerName =
         p.partnerName || p?.partner?.name || p?.partner?.fullName || "";
+
+      // UNIÃO de referências de serviços (serviceIds + items + services)
+      const set = new Set<string>();
+      const add = (v: any) => {
+        const s = String(
+          v?._id ?? v?.id ?? v?.serviceId ?? v?.service ?? v ?? ""
+        ).trim();
+        if (s) set.add(s);
+      };
+      if (Array.isArray(p.serviceIds)) p.serviceIds.forEach(add);
+      if (Array.isArray(p.items)) p.items.forEach(add);
+      if (Array.isArray(p.services)) p.services.forEach(add);
+      const serviceIds = Array.from(set);
 
       return {
         ...p,
         id,
         partnerName,
         total: totalValue,
-        serviceIds: Array.isArray(p.serviceIds) ? p.serviceIds.map((s: any) => String(s)) : [],
+        serviceIds,
       };
     });
 
     res.json({
       items: normalized,
       total,
-      page,
-      pageSize,
-      totalPages: Math.ceil(total / pageSize),
+      page: wantAll ? 1 : page,
+      pageSize: wantAll ? normalized.length : pageSize,
+      totalPages: wantAll ? 1 : Math.ceil(total / pageSize),
     });
   })
 );
