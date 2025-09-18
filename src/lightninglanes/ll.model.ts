@@ -1,4 +1,3 @@
-// src/lightninglanes/ll.model.ts
 import mongoose, { Schema, Types } from "mongoose";
 
 export type LaneStatus = "pending" | "approved" | "rejected" | "paid";
@@ -6,6 +5,7 @@ export type LaneStatus = "pending" | "approved" | "rejected" | "paid";
 export interface LightningLane {
   _id: Types.ObjectId;
   partnerId: Types.ObjectId | string;
+  partnerFullName?: string;            // ← NEW
   clientName: string;
   laneType: "single" | "multi" | "premier";
   amount: number;
@@ -14,14 +14,15 @@ export interface LightningLane {
   visitDate?: Date | null;
   receipts: string[];
   status: LaneStatus;
-  observation?: string; // <<< novo campo
+  observation?: string;
   createdAt: Date;
   updatedAt: Date;
 }
 
 const LightningLaneSchema = new Schema<LightningLane>(
   {
-    partnerId: { type: Schema.Types.Mixed, required: true }, // aceita ObjectId ou string legada
+    partnerId: { type: Schema.Types.Mixed, required: true },
+    partnerFullName: { type: String, default: "", trim: true }, // ← NEW
     clientName: { type: String, required: true, trim: true },
     laneType: { type: String, enum: ["single", "multi", "premier"], required: true },
     amount: { type: Number, required: true, min: 0 },
@@ -30,12 +31,11 @@ const LightningLaneSchema = new Schema<LightningLane>(
     visitDate: { type: Date, default: null },
     receipts: { type: [String], default: [] },
     status: { type: String, enum: ["pending", "approved", "rejected", "paid"], default: "pending" },
-    observation: { type: String, default: "", trim: true }, // <<< novo campo
+    observation: { type: String, default: "", trim: true },
   },
   { timestamps: true }
 );
 
-// Índice para ordenação recente
 LightningLaneSchema.index({ createdAt: -1 });
 
 export default mongoose.models.LightningLane ||

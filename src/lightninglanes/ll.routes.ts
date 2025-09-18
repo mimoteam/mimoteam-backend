@@ -1,4 +1,3 @@
-// src/lightninglanes/ll.routes.ts
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
@@ -19,12 +18,24 @@ const router = Router();
 const baseDir = path.resolve(process.cwd(), "uploads", "lanes");
 fs.mkdirSync(baseDir, { recursive: true });
 
+function extFromMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("png")) return ".png";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("gif")) return ".gif";
+  if (m.includes("heic") || m.includes("heif")) return ".heic";
+  if (m.includes("tif")) return ".tif";
+  if (m.includes("bmp")) return ".bmp";
+  return path.extname(m) || ".jpg";
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, baseDir),
   filename: (_req, file, cb) => {
     const ts = Date.now();
-    const ext = path.extname(file.originalname) || ".jpg";
-    const name = file.fieldname || "files";
+    const ext = extFromMime(file.mimetype) || path.extname(file.originalname) || ".jpg";
+    const name = (file.fieldname || "files").replace(/[^\w-]+/g, "").slice(0, 32) || "files";
     cb(null, `${name}-${ts}-${Math.random().toString(36).slice(2)}${ext}`);
   }
 });

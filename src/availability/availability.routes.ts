@@ -1,9 +1,10 @@
 // src/availability/availability.routes.ts
-type AvRow = { date: string; state: "busy" | "unavailable"; by?: "admin" | "partner" | "unknown" };
-
 import { Router } from "express";
 import { Availability } from "./availability.model";
 import { Types } from "mongoose";
+import { auth } from "../middleware/auth"; // ⬅️ garanta o caminho correto
+
+type AvRow = { date: string; state: "busy" | "unavailable"; by?: "admin" | "partner" | "unknown" };
 
 const router = Router();
 
@@ -12,6 +13,11 @@ const isYmd = (v: unknown): v is string =>
   typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 const PROJ = { _id: 0, date: 1, state: 1, by: 1 } as const;
+
+function mkPartnerKey(val: any): string {
+  const s = String(val || "");
+  return Types.ObjectId.isValid(s) ? String(new Types.ObjectId(s)) : s;
+}
 
 /** Descobre o tipo real do campo partnerId no schema (String | ObjectId) e normaliza o valor */
 function resolvePartnerId(raw: string) {
@@ -25,62 +31,101 @@ function resolvePartnerId(raw: string) {
   return s || null;
 }
 
+function getRole(req: any): "admin" | "partner" | "other" {
+  const r = String(req?.user?.role || "").toLowerCase();
+  if (r === "admin") return "admin";
+  if (r === "partner") return "partner";
+  return "other";
+}
+
+function getUserId(req: any): string {
+  return String(req?.user?._id || req?.user?.id || "");
+}
+
+/* 🔐 TODAS as rotas exigem login */
+router.use(auth());
+
 /* =========================================================================
 GET /availability?partnerId=&dateFrom=&dateTo=
-— usa o driver nativo para evitar cast no campo "date" (String com $gte/$lte)
+— Admin: exige partnerId no query
+— Partner: ignora partnerId e usa req.user._id
+— Usa $or em partnerKey/partnerId p/ cobrir legado
 ========================================================================= */
 router.get("/", async (req, res) => {
   try {
+    const role = getRole(req);
+    if (role === "other") return res.status(403).json({ error: "forbidden" });
+
     const q = req.query as Record<string, any>;
-    const partnerIdRaw = String(q.partnerId || "");
     const from = String(q.dateFrom || "");
     const to   = String(q.dateTo   || "");
+    if (!isYmd(from) || !isYmd(to)) {
+      return res.status(400).json({ message: "dateFrom/dateTo devem ser YYYY-MM-DD" });
+    }
 
-    if (!partnerIdRaw || !isYmd(from) || !isYmd(to)) {
-      return res.status(400).json({ message: "partnerId, dateFrom e dateTo são obrigatórios (YYYY-MM-DD)" });
+    // partnerId efetivo
+    let partnerIdRaw = "";
+    if (role === "admin") {
+      partnerIdRaw = String(q.partnerId || "");
+      if (!partnerIdRaw) return res.status(400).json({ message: "partnerId é obrigatório para admin" });
+    } else {
+      partnerIdRaw = getUserId(req);
+      if (!partnerIdRaw) return res.status(401).json({ error: "unauthorized" });
     }
 
     const pid = resolvePartnerId(partnerIdRaw);
     if (!pid) return res.status(400).json({ message: "Invalid partnerId" });
+    const pkey = mkPartnerKey(partnerIdRaw);
 
     const rows = await (Availability as any).collection
-      .find({ partnerId: pid, date: { $gte: from, $lte: to } }, { projection: PROJ })
+      .find(
+        {
+          date: { $gte: from, $lte: to },
+          $or: [{ partnerId: pid }, { partnerKey: pkey }],
+        },
+        { projection: PROJ }
+      )
       .sort({ date: 1 })
       .toArray();
 
     return res.json(rows || []);
   } catch (err: any) {
     console.error("GET /availability error:", err?.message);
-    // se preferir fail-open:
-    // return res.json([]);
     return res.status(500).json({ error: "list_failed", message: err?.message || "unknown" });
   }
 });
 
 /* =========================================================================
 PATCH /availability/:date
-— operações sem operadores em "date" podem usar Mongoose normalmente
+— Admin: pode alterar qualquer partner (via body.partnerId)
+— Partner: força partnerId = req.user._id e actor='partner'
+— Partner não libera 'busy'
 ========================================================================= */
 router.patch("/:date", async (req, res) => {
   try {
+    const role = getRole(req);
+    if (role === "other") return res.status(403).json({ error: "forbidden" });
+
     const date = String(req.params?.date || "");
     const body = (req.body ?? {}) as Record<string, any>;
+    if (!isYmd(date)) return res.status(400).json({ error: "Invalid date (YYYY-MM-DD)" });
 
-    const partnerIdRaw = String(body.partnerId || "");
+    // estado desejado
     const state = String(body.state || "").toLowerCase();
-    const actor: "admin" | "partner" =
-      String(body.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner";
-
-    if (!partnerIdRaw) return res.status(400).json({ error: "partnerId is required" });
-    if (!isYmd(date))   return res.status(400).json({ error: "Invalid date (YYYY-MM-DD)" });
     if (!["available", "unavailable", "busy"].includes(state)) {
       return res.status(400).json({ error: "state must be available|unavailable|busy" });
     }
 
+    // partnerId efetivo + actor efetivo
+    const partnerIdRaw =
+      role === "admin" ? String(body.partnerId || "") : getUserId(req);
+    const actor: "admin" | "partner" = role === "admin" ? "admin" : "partner";
+
+    if (!partnerIdRaw) return res.status(400).json({ error: "partnerId is required" });
+
     // normaliza partnerId conforme o tipo do schema
     const path: any = (Availability as any).schema?.path?.("partnerId");
     const instance = String(path?.instance || "").toLowerCase();
-
     const mkPid = (raw: string) => {
       if (instance === "objectid") {
         if (!Types.ObjectId.isValid(raw)) throw new Error("Invalid partnerId");
@@ -91,7 +136,6 @@ router.patch("/:date", async (req, res) => {
       if (!s) throw new Error("Invalid partnerId");
       return { filter: { partnerId: s }, value: s };
     };
-
     const { filter, value } = mkPid(partnerIdRaw);
 
     // se já está busy, partner não pode liberar
@@ -123,20 +167,25 @@ router.patch("/:date", async (req, res) => {
 
 /* =========================================================================
 POST /availability/bulk
-— gera lista de dias (UTC) e checa "busy" via driver nativo (date: {$in: [...]})
+— Admin: pode aplicar em qualquer partner (body.partnerId)
+— Partner: força partnerId = req.user._id, actor='partner' e não sobrescreve 'busy'
 ========================================================================= */
 router.post("/bulk", async (req, res) => {
   try {
+    const role = getRole(req);
+    if (role === "other") return res.status(403).json({ error: "forbidden" });
+
     const b = (req.body ?? {}) as Record<string, any>;
-    const partnerIdRaw = String(b.partnerId || "");
     const from = String(b.from || "");
     const to   = String(b.to   || "");
     const state = String(b.state || "").toLowerCase(); // "available" | "unavailable"
-    const actor: "admin" | "partner" =
-      String(b.actor || "partner").toLowerCase() === "admin" ? "admin" : "partner";
     const weekdays: number[] = Array.isArray(b.weekdays)
       ? b.weekdays.map((n:any) => Number(n)).filter((n:number) => Number.isInteger(n) && n>=0 && n<=6)
       : [];
+
+    // partnerId/actor efetivos
+    const partnerIdRaw = role === "admin" ? String(b.partnerId || "") : getUserId(req);
+    const actor: "admin" | "partner" = role === "admin" ? "admin" : "partner";
 
     if (!partnerIdRaw) return res.status(400).json({ error: "partnerId is required" });
     if (!isYmd(from) || !isYmd(to)) return res.status(400).json({ error: "from/to must be YYYY-MM-DD" });
@@ -144,7 +193,7 @@ router.post("/bulk", async (req, res) => {
       return res.status(400).json({ error: "state must be available|unavailable" });
     }
 
-    // partnerId normalizado
+    // partnerId normalizado (para driver nativo)
     const pid = resolvePartnerId(partnerIdRaw);
     if (!pid) return res.status(400).json({ error: "Invalid partnerId" });
 
@@ -174,7 +223,7 @@ router.post("/bulk", async (req, res) => {
     }
     if (!keys.length) return res.json({ upserts: 0, deleted: 0, skippedBusy: 0 });
 
-    // partner não sobrescreve dias busy — checa via driver nativo (evita cast do Mongoose)
+    // partner não sobrescreve dias busy — checa via driver nativo
     let busySet = new Set<string>();
     if (actor === "partner") {
       const busyRows: { date: string }[] = await (Availability as any).collection
@@ -183,7 +232,6 @@ router.post("/bulk", async (req, res) => {
       busySet = new Set(busyRows.map(r => r.date));
     }
 
-    // monta operações únicas por dia
     const ops: any[] = [];
     let upserts = 0, deleted = 0, skippedBusy = 0;
 
@@ -207,7 +255,6 @@ router.post("/bulk", async (req, res) => {
 
     if (!ops.length) return res.json({ upserts, deleted, skippedBusy });
 
-    // ordered:true evita colisão interna caso a mesma chave apareça 2x por algum motivo
     await (Availability as any).bulkWrite(ops, { ordered: true });
 
     return res.json({ upserts, deleted, skippedBusy });
