@@ -18,6 +18,9 @@
     "db:admin": "ts-node scripts/upsert-admin.ts"
   },
   "dependencies": {
+    "@simplewebauthn/browser": "^13.2.0",
+    "@simplewebauthn/server": "^13.2.1",
+    "@simplewebauthn/types": "^12.0.0",
     "bcryptjs": "^3.0.2",
     "compression": "^1.8.1",
     "cookie-parser": "^1.4.7",
@@ -33,6 +36,7 @@
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
     "response-time": "^2.3.4",
+    "sharp": "^0.34.3",
     "socket.io-client": "^4.8.1",
     "zod": "^4.1.3"
   },

@@ -1,3 +1,4 @@
+// src/app.ts
 import express from "express";
 import type { Request, Response, RequestHandler } from "express";
 import cors, { type CorsOptions } from "cors";
@@ -7,6 +8,15 @@ import cookieParser from "cookie-parser";
 import compression from "compression";
 import responseTime from "response-time";
 import path from "path";
+import { randomBytes } from "crypto";
+
+// ✅ use named import para evitar overload mismatch
+import {
+  sign as jwtSign,
+  type Secret as JwtSecret,
+  type SignOptions,
+  type JwtPayload,
+} from "jsonwebtoken";
 
 import authRoutes from "./auth/auth.routes";
 import userRoutes from "./users/users.routes";
@@ -19,13 +29,20 @@ import uploadRoutes from "./upload/upload.routes";
 // import handoverRoutes from "./handover/handover.routes";
 import statusRoutes from "./status/status.routes";
 
-import { ensureUploadDirs, ROOT_UPLOADS } from "./config/uploads";
+import { ensureUploadDirs } from "./config/uploads";
 import { auth } from "./middleware/auth";
 import { notFound, errorHandler } from "./middleware/error";
 import { env } from "./config/env";
 
 /* ✅ Lightning Lane */
 import lanesRouter from "./lightninglanes/ll.routes";
+
+/* ✅ Billing */
+import billingRoutes from "./billing/billing.routes";
+
+/* (Opcional) User model para stubs de WebAuthn (vincular usuário pelo username/email) */
+import User from "./users/user.model";
+import bcrypt from "bcryptjs";
 
 let debugRoutes: any = null;
 if (env.NODE_ENV !== "production") {
@@ -48,7 +65,6 @@ const envOrigins = (process.env.CORS_ORIGIN || DEFAULT_ORIGINS.join(","))
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 const allowed = new Set(envOrigins);
 
 /* HOTFIX preflight */
@@ -72,12 +88,12 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader(
       "Access-Control-Allow-Methods",
-      "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD",
     );
     res.setHeader("Access-Control-Allow-Headers", acrh);
     res.setHeader(
       "Vary",
-      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
     );
     return res.status(204).end();
   }
@@ -113,11 +129,27 @@ const corsOptions: CorsOptions = {
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 
+/* 👉 ECO DE ORIGIN (garante header também em respostas de erro) */
+app.use((req, res, next) => {
+  const origin = req.headers.origin as string | undefined;
+  const isAllowed =
+    !!origin &&
+    (allowed.has(origin) ||
+      (process.env.NODE_ENV !== "production" &&
+        /^http:\/\/localhost:\d+$/i.test(origin)));
+  if (isAllowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  }
+  next();
+});
+
 /* ===== Middlewares ===== */
 app.use(
   helmet({
     crossOriginResourcePolicy: false,
-  })
+  }),
 );
 app.use(compression());
 app.use(responseTime());
@@ -144,7 +176,7 @@ app.use((req, _res, next) => {
     if (req.method === "OPTIONS") {
       console.log(
         "[DEBUG][PREFLIGHT] ACRH =",
-        req.header("Access-Control-Request-Headers")
+        req.header("Access-Control-Request-Headers"),
       );
     }
   }
@@ -155,12 +187,11 @@ app.use((req, _res, next) => {
 ensureUploadDirs();
 app.use(
   "/uploads",
-  express.static(path.resolve(ROOT_UPLOADS), {
-    etag: true,
-    lastModified: true,
-    maxAge: "7d",
-    immutable: false,
-  })
+  express.static(path.resolve(process.cwd(), "uploads"), {
+    fallthrough: true,
+    setHeaders: (res) =>
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable"),
+  }),
 );
 
 /* ===== Health ===== */
@@ -178,7 +209,7 @@ mirror(["/users", "/api/users"], userRoutes);
 mirror(["/services", "/api/services"], serviceRoutes);
 mirror(["/costs", "/api/costs"], costRoutes);
 
-/* 🔧 AQUI ESTAVA O PROBLEMA — precisa INVOCAR o factory */
+/* payments exigem auth() (já estava assim) */
 mirror(["/payments", "/api/payments"], auth(), paymentRoutes);
 
 mirror(["/availability", "/api/availability"], availabilityRoutes);
@@ -189,12 +220,212 @@ mirror(["/status", "/api/status"], statusRoutes);
 app.use("/lanes", lanesRouter);
 app.use("/api/lanes", lanesRouter);
 
+/* ✅ Billing (espelhado em /billing e /api/billing) */
+mirror(["/billing", "/api/billing"], billingRoutes);
+
 /* Debug (DEV) */
 if (debugRoutes) {
   app.use("/api", debugRoutes);
 }
 
-/* NOOP stubs, se quiser manter */
+/* =========================================================
+   ✅ WebAuthn DEV Stubs (para eliminar 404 e fluir no front)
+   ========================================================= */
+const JWT_SECRET: JwtSecret =
+  ((env.JWT_SECRET as unknown) as JwtSecret) || "dev-secret";
+
+const signToken = (payload: JwtPayload | string): string => {
+  const opts: SignOptions = {
+    // garante o tipo correto do expiresIn
+    expiresIn:
+      (process.env.JWT_EXPIRES_IN as SignOptions["expiresIn"]) || "7d",
+  };
+  return jwtSign(payload, JWT_SECRET, opts);
+};
+
+const toB64Url = (buf: Buffer) =>
+  buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+const randomChallenge = (len = 32) => toB64Url(randomBytes(len));
+
+const rpIdFromReq = (req: Request) =>
+  (process.env.WEBAUTHN_RPID ||
+    (req.hostname || "localhost").replace(/:\d+$/, "") ||
+    "localhost") as string;
+
+type WAFlow = "login" | "register";
+function setWAState(
+  res: Response,
+  flow: WAFlow,
+  username: string,
+  challenge: string,
+) {
+  res.cookie("wa_flow", flow, { sameSite: "lax" });
+  res.cookie("wa_user", username || "", { sameSite: "lax" });
+  res.cookie("wa_chal", challenge, { sameSite: "lax" });
+}
+function readWAState(req: Request) {
+  const flow = (req.cookies?.wa_flow || "") as WAFlow;
+  const username = (req.cookies?.wa_user || "") as string;
+  const challenge = (req.cookies?.wa_chal || "") as string;
+  return { flow, username, challenge };
+}
+
+/* OPTIONS: Login */
+app.post("/webauthn/login/options", async (req: Request, res: Response) => {
+  const { username } = req.body || {};
+  const uname = String(username || "").trim();
+  if (!uname) return res.status(400).json({ message: "username required" });
+
+  const challenge = randomChallenge();
+  setWAState(res, "login", uname, challenge);
+
+  const rpId = rpIdFromReq(req);
+  const options = {
+    publicKey: {
+      challenge, // string base64url — o front converte p/ ArrayBuffer
+      timeout: 60000,
+      rpId,
+      userVerification: "preferred",
+      allowCredentials: [] as Array<{
+        id: string;
+        type: "public-key";
+        transports?: string[];
+      }>,
+    },
+  };
+  res.json(options);
+});
+
+/* VERIFY: Login (stub) */
+app.post("/webauthn/login/verify", async (req: Request, res: Response) => {
+  const { username } = readWAState(req);
+  if (!username)
+    return res.status(400).json({ message: "No pending WebAuthn login" });
+
+  const userDoc =
+    (await User.findOne({
+      $or: [
+        { login: new RegExp(`^${username}$`, "i") },
+        { email: new RegExp(`^${username}$`, "i") },
+      ],
+    })) || null;
+
+  if (!userDoc) {
+    return res
+      .status(404)
+      .json({ message: "User not found for passkey login" });
+  }
+
+  const payload = {
+    _id: String(userDoc._id),
+    id: String(userDoc._id),
+    email: userDoc.email,
+    fullName: (userDoc as any).fullName || "",
+    role: userDoc.role || "partner",
+  };
+  const token = signToken(payload);
+  res.cookie?.("token", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  const { password, __v, ...safe } =
+    (userDoc.toObject ? userDoc.toObject({ virtuals: true }) : userDoc) || {};
+  return res.json({ user: safe, token });
+});
+
+/* OPTIONS: Register */
+app.post("/webauthn/register/options", async (req: Request, res: Response) => {
+  const { username, displayName, userId } = req.body || {};
+  const uname = String(username || "").trim();
+  const dname = String(displayName || uname || "User").trim();
+  if (!uname) return res.status(400).json({ message: "username required" });
+
+  const challenge = randomChallenge();
+  setWAState(res, "register", uname, challenge);
+
+  const uidRaw = userId ? Buffer.from(String(userId)) : Buffer.from(uname);
+  const rpId = rpIdFromReq(req);
+
+  const options = {
+    publicKey: {
+      challenge, // string base64url; o front converte
+      rp: { name: "MIMO Team", id: rpId },
+      user: {
+        id: toB64Url(uidRaw), // string base64url; o front converte
+        name: uname,
+        displayName: dname,
+      },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7 },   // ES256
+        { type: "public-key", alg: -257 }, // RS256
+      ],
+      timeout: 60000,
+      attestation: "none",
+      authenticatorSelection: {
+        residentKey: "preferred",
+        requireResidentKey: false,
+        userVerification: "preferred",
+      },
+    },
+  };
+
+  res.json(options);
+});
+
+/* VERIFY: Register (stub) */
+app.post("/webauthn/register/verify", async (req: Request, res: Response) => {
+  const { username } = readWAState(req);
+  const uname = String(username || "").trim();
+  if (!uname)
+    return res
+      .status(400)
+      .json({ message: "No pending WebAuthn registration" });
+
+  let userDoc =
+    (await User.findOne({
+      $or: [
+        { login: new RegExp(`^${uname}$`, "i") },
+        { email: new RegExp(`^${uname}$`, "i") },
+      ],
+    })) || null;
+
+  if (!userDoc) {
+    const email = uname.includes("@") ? uname : `${uname}@example.local`;
+    const passwordHash = await bcrypt.hash(`passkey:${uname}:${Date.now()}`, 8);
+    userDoc = await User.create({
+      login: uname,
+      email,
+      fullName: uname,
+      role: "partner",
+      password: passwordHash,
+    });
+  }
+
+  const payload = {
+    _id: String(userDoc._id),
+    id: String(userDoc._id),
+    email: userDoc.email,
+    fullName: (userDoc as any).fullName || "",
+    role: userDoc.role || "partner",
+  };
+  const token = signToken(payload);
+
+  res.cookie?.("token", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  const { password, __v, ...safe } =
+    (userDoc.toObject ? userDoc.toObject({ virtuals: true }) : userDoc) || {};
+  return res.json({ ok: true, user: safe, token });
+});
+
+/* NOOP stubs (se quiser manter) */
 const noopListHandler: RequestHandler = (req: Request, res: Response) => {
   const page = Number((req.query?.page as string) || "1");
   const pageSize = Number((req.query?.pageSize as string) || "50");
@@ -202,7 +433,7 @@ const noopListHandler: RequestHandler = (req: Request, res: Response) => {
 };
 
 ["/api/tasks", "/tasks", "/admin/tasks", "/dashboard/tasks"].forEach((p) =>
-  app.get(p, noopListHandler)
+  app.get(p, noopListHandler),
 );
 
 [

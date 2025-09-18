@@ -1,4 +1,4 @@
-// src/middleware/auth.ts
+// src/middleware/auth.v2.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt, { JwtPayload } from "jsonwebtoken";
 import { env } from "../config/env";
@@ -6,7 +6,6 @@ import { env } from "../config/env";
 /** Payload esperado dentro do JWT */
 export type JwtUser = JwtPayload & {
   _id: string;
-  id?: string;          // <- alias normalizado
   role?: string;
   userType?: string;
   email?: string;
@@ -15,14 +14,9 @@ export type JwtUser = JwtPayload & {
   [k: string]: any;
 };
 
-declare global {
-  namespace Express {
-    interface Request {
-      user?: JwtUser | null;
-    }
-  }
-}
-
+// ⚠️ Não altero o tipo global se seu projeto já define Request.user em outro lugar.
+// Se NÃO houver outro augmentation, ative este bloco criando o .d.ts do passo 2.
+// (Aqui, só exporto as funções.)
 const DEBUG = env.NODE_ENV !== "production" || process.env.DEBUG_AUTH === "1";
 
 function looksLikeJwt(t?: string | null): t is string {
@@ -31,7 +25,7 @@ function looksLikeJwt(t?: string | null): t is string {
 
 function normalizeRole(raw?: unknown): string {
   const s = String(raw ?? "").trim().toLowerCase();
-  if (["admin", "administrator", "root", "superadmin", "super-admin", "owner"].includes(s)) return "admin";
+  if (["admin", "administrator", "root"].includes(s)) return "admin";
   if (["finance", "finanças"].includes(s)) return "finance";
   if (["manager", "gestor"].includes(s)) return "manager";
   if (["partner", "parceiro"].includes(s)) return "partner";
@@ -49,22 +43,12 @@ function extractToken(req: Request): string | null {
     const maybe = (m ? m[1] : trimmed).trim();
     if (looksLikeJwt(maybe)) return maybe;
   }
-
   const ck = (req as any).cookies || {};
-  const cookieKeys = [
-    "token",
-    "auth_token_v1",
-    "auth_token",
-    "access_token",
-    "jwt",
-    "id_token",
-    "Authorization",
-  ];
+  const cookieKeys = ["token","auth_token_v1","auth_token","access_token","jwt","id_token","Authorization"];
   for (const k of cookieKeys) {
     const v = ck?.[k];
     if (looksLikeJwt(v)) return String(v);
   }
-
   const allowQuery =
     env.NODE_ENV !== "production" || process.env.DEBUG_AUTH_TOKEN === "1";
   if (allowQuery) {
@@ -78,7 +62,6 @@ function extractToken(req: Request): string | null {
       if (looksLikeJwt(cleaned)) return cleaned;
     }
   }
-
   return null;
 }
 
@@ -95,7 +78,6 @@ export function auth(requiredRole?: string) {
       if (DEBUG) console.warn("[auth] token ausente (header/cookie/query)");
       return res.status(401).json({ message: "Unauthorized" });
     }
-
     let payload: JwtUser;
     try {
       payload = jwt.verify(token, env.JWT_SECRET, { algorithms: ["HS256"] }) as JwtUser;
@@ -103,7 +85,6 @@ export function auth(requiredRole?: string) {
       if (DEBUG) console.warn("[auth] invalid token:", e?.message);
       return res.status(401).json({ message: "Invalid token" });
     }
-
     const uid =
       payload?._id ??
       (payload as any)?.sub ??
@@ -116,8 +97,8 @@ export function auth(requiredRole?: string) {
       payload?.role ?? payload?.userType ?? (payload as any)?.user_type
     );
 
-    const uidStr = uid ? String(uid) : "";
-    req.user = { ...payload, _id: uidStr, id: uidStr, role };
+    // NÃO sobrescrevo req.user tipada globalmente; apenas anexo campo compatível.
+    (req as any).user = { ...(req as any).user, ...payload, _id: uid ? String(uid) : "", role };
 
     if (requiredRole) {
       if (role === "admin" || role === want) return next();
@@ -128,7 +109,7 @@ export function auth(requiredRole?: string) {
   };
 }
 
-/** Middleware opcional (NUNCA lança mesmo sem JWT_SECRET; apenas tenta popular req.user) */
+/** Middleware opcional (nunca lança) */
 export function authOptional() {
   return (req: Request, _res: Response, next: NextFunction) => {
     try {
@@ -139,7 +120,6 @@ export function authOptional() {
         if (DEBUG) console.warn("[authOptional] JWT_SECRET ausente; seguindo sem verificar token");
         return next();
       }
-
       try {
         const payload = jwt.verify(token, env.JWT_SECRET, { algorithms: ["HS256"] }) as JwtUser;
         const uid =
@@ -152,16 +132,18 @@ export function authOptional() {
         const role = normalizeRole(
           payload?.role ?? payload?.userType ?? (payload as any)?.user_type
         );
-        const uidStr = uid ? String(uid) : "";
-        req.user = { ...payload, _id: uidStr, id: uidStr, role };
+        (req as any).user = { ...(req as any).user, ...payload, _id: uid ? String(uid) : "", role };
       } catch (e: any) {
         if (DEBUG) console.warn("[authOptional] token inválido:", e?.message);
       }
-    } catch {
-      // segue sem usuário
-    }
+    } catch {}
     next();
   };
 }
 
-export default auth;
+// exports com sufixo para não confundir com o auth “antigo” ao importar
+export const authV2 = auth;
+export const authOptionalV2 = authOptional;
+export type JwtUserV2 = JwtUser;
+
+export default authV2;

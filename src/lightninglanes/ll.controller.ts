@@ -1,8 +1,8 @@
-// src/lightninglanes/ll.controller.ts
 import type { Request, Response } from "express";
 import path from "path";
 import fs from "fs/promises";
 import mongoose, { Types } from "mongoose";
+import sharp from "sharp";
 import LightningLaneModel, { type LaneStatus } from "./ll.model";
 
 /* ===== Helpers ===== */
@@ -31,16 +31,13 @@ function dbReady() {
   catch { return false; }
 }
 
-/** GET /lanes?status=pending&page=1&pageSize=50&mine=true|false
- *  (ordenado por createdAt desc, depois visitDate desc)
- */
+/** GET /lanes?status=pending&page=1&pageSize=50&mine=true|false */
 export async function listLanes(req: Request, res: Response) {
   const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
   const pageSize = Math.min(200, Math.max(1, parseInt(String(req.query.pageSize || "50"), 10) || 50));
 
   try {
     if (!dbReady()) {
-      console.warn("[LANES][LIST] DB not connected yet → empty list");
       return res.json({ items: [], total: 0, page, pageSize });
     }
 
@@ -53,7 +50,6 @@ export async function listLanes(req: Request, res: Response) {
 
     const and: any[] = [];
 
-    // Dono (aceita ObjectId ou string legada)
     if (mine || role === "partner") {
       if (!meId) return res.json({ items: [], total: 0, page, pageSize });
       const byOwner: any[] = [{ partnerId: meId }];
@@ -61,20 +57,14 @@ export async function listLanes(req: Request, res: Response) {
       and.push({ $or: byOwner });
     }
 
-    // Status opcional
     const rawStatus = String(req.query.status || "").trim();
     if (isLaneStatus(rawStatus)) and.push({ status: rawStatus });
 
     const q = and.length ? { $and: and } : {};
 
-    if (req.query.debug === "1") {
-      console.log("[LANES][DEBUG] role=", role, "mine=", mine, "meId=", meId);
-      console.log("[LANES][DEBUG] filter=", JSON.stringify(q, null, 2));
-    }
-
     const [items, total] = await Promise.all([
       LightningLaneModel.find(q)
-        .sort({ createdAt: -1, visitDate: -1, _id: -1 }) // <<< mais recentes primeiro
+        .sort({ createdAt: -1, visitDate: -1, _id: -1 })
         .skip((page - 1) * pageSize)
         .limit(pageSize)
         .lean()
@@ -96,6 +86,8 @@ export async function createLane(req: Request, res: Response) {
   if (!rawId) return res.status(401).json({ message: "Unauthorized" });
 
   const partnerRef: any = Types.ObjectId.isValid(rawId) ? new Types.ObjectId(rawId) : rawId;
+  const partnerFullName: string =
+    user?.fullName || user?.name || user?.displayName || "";
 
   const {
     clientName, laneType, amount, paymentMethod, cardLast4, visitDate, observation
@@ -107,13 +99,14 @@ export async function createLane(req: Request, res: Response) {
 
   const lane = await LightningLaneModel.create({
     partnerId: partnerRef,
+    partnerFullName, // ← para “Upload by”
     clientName: titleCaseName(clientName),
     laneType,
     amount: Number(amount || 0),
     paymentMethod,
     cardLast4: paymentMethod === "mimo_card" ? String(cardLast4 || "").slice(-4) : null,
     visitDate: parseVisitDate(visitDate),
-    observation: String(observation || "").trim(), // <<< salva observação
+    observation: String(observation || "").trim(),
     receipts: [],
     status: "pending" as LaneStatus,
   });
@@ -153,7 +146,7 @@ export async function updateLane(req: Request, res: Response) {
         ? String(body.cardLast4 || "").slice(0, 4)
         : null;
     if (body.visitDate) patch.visitDate = parseVisitDate(body.visitDate);
-    if (body.observation !== undefined) patch.observation = String(body.observation || "").trim(); // <<< atualiza observação
+    if (body.observation !== undefined) patch.observation = String(body.observation || "").trim();
   }
 
   Object.assign(lane, patch);
@@ -161,7 +154,7 @@ export async function updateLane(req: Request, res: Response) {
   res.json({ lane });
 }
 
-/** DELETE /lanes/:id — remove o serviço inteiro + recibos */
+/** DELETE /lanes/:id */
 export async function deleteLane(req: Request, res: Response) {
   const id = String(req.params.id || "");
   if (!Types.ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid id" });
@@ -194,16 +187,62 @@ export async function addReceipts(req: Request, res: Response) {
   if (!Types.ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid id" });
 
   const files = (req.files as Express.Multer.File[]) || [];
-  const urls = files.map((f) => `/uploads/lanes/${path.basename(f.filename)}`);
+  const baseDir = path.resolve(process.cwd(), "uploads", "lanes");
+
+  const finalUrls: string[] = [];
+
+  for (const f of files) {
+    const inName = path.basename(f.filename);
+    const inAbs = path.resolve(baseDir, inName);
+
+    let outName = inName;
+    let outAbs = inAbs;
+
+    try {
+      const img = sharp(inAbs, { limitInputPixels: 268402689 }).rotate();
+      const meta = await img.metadata();
+
+      const mime = (f.mimetype || "").toLowerCase();
+      const isHeic = mime.includes("heic") || mime.includes("heif");
+      const isTiff = mime.includes("tif");
+      const isBmp  = mime.includes("bmp");
+      const isGif  = mime.includes("gif");
+      const isPng  = mime.includes("png");
+      const hasAlpha = !!meta.hasAlpha;
+
+      let targetExt = ".jpg";
+      if (isPng && hasAlpha) targetExt = ".png";
+      if (isHeic || isTiff || isBmp || isGif) targetExt = hasAlpha ? ".png" : ".jpg";
+
+      const alreadyOk =
+        (mime.includes("jpeg") || mime.includes("jpg")) ||
+        (mime.includes("png") && (hasAlpha || !isHeic));
+
+      if (!alreadyOk || isHeic || isTiff || isBmp || isGif) {
+        const baseNoExt = inName.replace(/\.[^.]+$/i, "");
+        outName = `${baseNoExt}${targetExt}`;
+        outAbs = path.resolve(baseDir, outName);
+
+        if (targetExt === ".png") {
+          await img.png({ compressionLevel: 9 }).toFile(outAbs);
+        } else {
+          await img.jpeg({ quality: 82, mozjpeg: true }).toFile(outAbs);
+        }
+        await fs.unlink(inAbs).catch(() => {});
+      }
+    } catch {}
+
+    finalUrls.push(`/uploads/lanes/${outName}`);
+  }
 
   const lane = await LightningLaneModel.findByIdAndUpdate(
     id,
-    { $push: { receipts: { $each: urls } } },
+    { $push: { receipts: { $each: finalUrls } } },
     { new: true }
   ).lean();
 
   if (!lane) return res.status(404).json({ message: "Not found" });
-  res.json({ lane, added: urls });
+  res.json({ lane, added: finalUrls });
 }
 
 /** DELETE /lanes/:id/receipts?url=/uploads/lanes/xxx.jpg */

@@ -1,4 +1,3 @@
-// src/auth/auth.routes.ts
 import { Router, type Request, type Response, type NextFunction } from "express";
 import * as jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -103,6 +102,47 @@ router.post("/login", async (req: Request, res: Response, next: NextFunction) =>
     res.json({ token, user: sanitize(userDoc) });
   } catch (err) {
     next(err);
+  }
+});
+
+/* ---------- POST /auth/logout ---------- */
+router.post("/logout", (_req: Request, res: Response) => {
+  try {
+    res.clearCookie?.("token", { sameSite: "lax", secure: process.env.NODE_ENV === "production" });
+  } catch {}
+  return res.json({ ok: true });
+});
+
+/* ---------- POST /auth/refresh ---------- */
+/* Requer um token válido no Authorization: Bearer ou cookie; renova a expiração */
+router.post("/refresh", auth(), async (req: Request, res: Response) => {
+  try {
+    const u = (req.user as any) || {};
+    if (!u || !u.id) return res.status(401).json({ message: "Unauthorized" });
+
+    const payload = {
+      _id: String(u._id || u.id),
+      id: String(u._id || u.id),
+      email: u.email,
+      fullName: u.fullName || "",
+      role: u.role || "partner",
+    };
+
+    const accessToken = jwt.sign(payload, JWT_SECRET, {
+      expiresIn: JWT_EXPIRES_IN,
+      algorithm: "HS256",
+    });
+
+    res.cookie?.("token", accessToken, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return res.json({ ok: true, accessToken });
+  } catch (err) {
+    return res.status(500).json({ message: "Internal error" });
   }
 });
 
