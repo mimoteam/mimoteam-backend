@@ -1,4 +1,3 @@
-// backend/src/payments/payment.model.ts
 import { Schema, model, Document } from "mongoose";
 
 interface INoteLog { id: string; text: string; at: Date; }
@@ -6,11 +5,14 @@ interface INoteLog { id: string; text: string; at: Date; }
 export interface IPayment extends Document {
   partnerId: string;
   partnerName?: string;
-  periodFrom?: string | null;
-  periodTo?: string | null;
+
+  // Agora como Date (antes eram string)
+  periodFrom?: Date | null;
+  periodTo?: Date | null;
   weekKey?: string | null;
-  weekStart?: string | null;
-  weekEnd?: string | null;
+  weekStart?: Date | null;
+  weekEnd?: Date | null;
+
   serviceIds: string[];
   extraIds: string[];
   total: number;
@@ -27,22 +29,16 @@ const NoteLogSchema = new Schema<INoteLog>({
   at:   { type: Date,   required: true },
 }, { _id: false });
 
-// converte valor em Date ISO string ou null
-const toIsoOrNull = (v: any) => {
-  if (v === null || v === undefined || v === '') return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-};
-
 const PaymentSchema = new Schema<IPayment>({
   partnerId:   { type: String, required: true, index: true },
   partnerName: { type: String, default: "" },
 
-  periodFrom:  { type: String, default: null, set: toIsoOrNull },
-  periodTo:    { type: String, default: null, set: toIsoOrNull },
+  // ✅ Datas como Date
+  periodFrom:  { type: Date, default: null, index: true },
+  periodTo:    { type: Date, default: null },
   weekKey:     { type: String, default: null, index: true },
-  weekStart:   { type: String, default: null, set: toIsoOrNull, index: true },
-  weekEnd:     { type: String, default: null, set: toIsoOrNull },
+  weekStart:   { type: Date, default: null, index: true },
+  weekEnd:     { type: Date, default: null },
 
   serviceIds:  { type: [String], default: [] },
   extraIds:    { type: [String], default: [] },
@@ -58,15 +54,15 @@ const PaymentSchema = new Schema<IPayment>({
   versionKey: false,
 });
 
-// índices úteis p/ listagem
+/* ── Índices úteis p/ listagem ── */
 PaymentSchema.index({ partnerId: 1, status: 1, weekStart: -1 });
 PaymentSchema.index({ weekStart: -1 });
 PaymentSchema.index({ createdAt: -1 });
 
-// dedup dos arrays
+/* ── Dedup dos arrays ── */
 PaymentSchema.pre('save', function (next) {
   if (Array.isArray(this.serviceIds)) this.serviceIds = Array.from(new Set(this.serviceIds.map(String)));
-  if (Array.isArray(this.extraIds)) this.extraIds = Array.from(new Set(this.extraIds.map(String)));
+  if (Array.isArray(this.extraIds))  this.extraIds  = Array.from(new Set(this.extraIds.map(String)));
   next();
 });
 

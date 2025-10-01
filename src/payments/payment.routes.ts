@@ -1,4 +1,3 @@
-// src/payments/payment.routes.ts
 import { Router, type Request, type Response, type NextFunction } from "express";
 import mongoose from "mongoose";
 import PaymentModel from "./payment.model";
@@ -16,7 +15,6 @@ const ah =
 /* ── util: paginação/ordenacao ──────────────────────────────── */
 function getPage(req: Request) {
   const page = Math.max(1, Number(req.query.page || 1));
-  // leve aumento no default/teto, mas ainda conservador
   const pageSize = Math.min(5000, Math.max(1, Number(req.query.pageSize || 500)));
   const skip = (page - 1) * pageSize;
   return { page, pageSize, skip, limit: pageSize };
@@ -28,7 +26,7 @@ function getSort(req: Request) {
   return { [sortBy]: dir } as AnyDoc;
 }
 
-/* ── util: filtro simples (partner/status/intervalo) ────────── */
+/* ── util: construir filtro de período (comparando Date com Date) ── */
 function buildFilter(req: Request) {
   const q: AnyDoc = {};
   const partnerId = (req.query.partnerId || req.query.partner) as string | undefined;
@@ -37,22 +35,23 @@ function buildFilter(req: Request) {
   if (partnerId) q.partnerId = String(partnerId);
   if (status) q.status = String(status);
 
-  // datas aceitando from/to ou dateFrom/dateTo
-  const from = (req.query.from || req.query.dateFrom) as string | undefined;
-  const to   = (req.query.to   || req.query.dateTo)   as string | undefined;
-  if (from || to) {
-    const gte = from ? new Date(from) : undefined;
-    const lte = to   ? new Date(to)   : undefined;
-    // cobre period* ou week* conforme existir
+  // datas aceitando from/to ou dateFrom/dateTo (podem vir como string)
+  const fromRaw = (req.query.from || req.query.dateFrom) as string | undefined;
+  const toRaw   = (req.query.to   || req.query.dateTo)   as string | undefined;
+
+  // Normaliza para Date (ou undefined)
+  const from = fromRaw ? new Date(fromRaw) : undefined;
+  const to   = toRaw   ? new Date(toRaw)   : undefined;
+
+  // Se o schema é Date, comparamos Date→Date.
+  // Critério de sobreposição: (start <= to) && (end >= from)
+  if ((from && !isNaN(from.getTime())) || (to && !isNaN(to.getTime()))) {
+    const lte = to   ?? new Date("9999-12-31T23:59:59.999Z");
+    const gte = from ?? new Date("0001-01-01T00:00:00.000Z");
+
     q.$or = [
-      {
-        periodFrom: { ...(gte ? { $lte: lte ?? new Date("9999-12-31") } : {}) },
-        periodTo:   { ...(lte ? { $gte: gte ?? new Date("0001-01-01") } : {}) },
-      },
-      {
-        weekStart:  { ...(gte ? { $lte: lte ?? new Date("9999-12-31") } : {}) },
-        weekEnd:    { ...(lte ? { $gte: gte ?? new Date("0001-01-01") } : {}) },
-      },
+      { periodFrom: { $lte: lte }, periodTo: { $gte: gte } },
+      { weekStart:  { $lte: lte }, weekEnd:  { $gte: gte } },
     ];
   }
 
@@ -99,7 +98,6 @@ router.get(
         baseFilter.partnerId = String(user.id || user._id);
       }
 
-      // buscamos pagamentos (sem filtrar por serviceIds no Mongo para evitar CastError)
       const proj: AnyDoc = {
         _id: 1,
         status: 1,
@@ -159,7 +157,7 @@ router.get(
   })
 );
 
-/* ── (opcional) eligible stub para não conflitar com '/:id' ─── */
+/* ── (opcional) eligible stub (mantido) ─────────────────────── */
 router.get(
   "/eligible",
   ah(async (req, res) => {
@@ -189,23 +187,23 @@ router.get(
       _id: 1,
       status: 1,
       partnerId: 1,
-      partnerName: 1, // se existir no schema
+      partnerName: 1,
       periodFrom: 1,
       periodTo: 1,
       weekStart: 1,
       weekEnd: 1,
+      weekKey: 1,
       serviceIds: 1,
-      items: 1,        // ← inclui campos legados
-      services: 1,     // ← inclui campos legados
-      total: 1,        // canônico
-      totalAmount: 1,  // compat legado
+      items: 1,
+      services: 1,
+      total: 1,
+      totalAmount: 1, // compat legado (se ainda houver)
       notes: 1,
       notesLog: 1,
       createdAt: 1,
       updatedAt: 1,
     };
 
-    // all=1 → sem paginação (para FinanceCenter enxergar tudo)
     const allParam = String((req.query as any).all || "").toLowerCase();
     const wantAll = allParam === "1" || allParam === "true" || allParam === "yes";
 
@@ -217,20 +215,17 @@ router.get(
       ? (Array.isArray(itemsRaw) ? itemsRaw.length : 0)
       : await PaymentModel.countDocuments(filter as AnyDoc).maxTimeMS(5000);
 
-    // Normalização conservadora (e união de serviceIds com legados)
+    // Normalização conservadora (união de referências de serviços + nome do parceiro + total)
     const normalized = (Array.isArray(itemsRaw) ? itemsRaw : []).map((p: AnyDoc) => {
       const id = String(p._id);
 
-      // total
       const totalValue =
         (typeof p.total === "number" ? p.total : undefined) ??
         (typeof p.totalAmount === "number" ? p.totalAmount : 0);
 
-      // partnerName fallback
       const partnerName =
         p.partnerName || p?.partner?.name || p?.partner?.fullName || "";
 
-      // UNIÃO de referências de serviços (serviceIds + items + services)
       const set = new Set<string>();
       const add = (v: any) => {
         const s = String(
@@ -239,8 +234,8 @@ router.get(
         if (s) set.add(s);
       };
       if (Array.isArray(p.serviceIds)) p.serviceIds.forEach(add);
-      if (Array.isArray(p.items)) p.items.forEach(add);
-      if (Array.isArray(p.services)) p.services.forEach(add);
+      if (Array.isArray(p.items))      p.items.forEach(add);
+      if (Array.isArray(p.services))   p.services.forEach(add);
       const serviceIds = Array.from(set);
 
       return {
@@ -295,30 +290,43 @@ router.post(
 
     const data: AnyDoc = {
       partnerId: body.partnerId || body.partner || null,
-      periodFrom: body.periodFrom || body.weekStart || null,
-      periodTo: body.periodTo || body.weekEnd || null,
-      weekStart: body.weekStart || null,
-      weekEnd: body.weekEnd || null,
+
+      // ✅ Recebe strings ou Date – Mongoose converte p/ Date
+      periodFrom: body.periodFrom ?? body.weekStart ?? null,
+      periodTo:   body.periodTo   ?? body.weekEnd   ?? null,
+      weekStart:  body.weekStart ?? null,
+      weekEnd:    body.weekEnd   ?? null,
+
       serviceIds: Array.isArray(body.serviceIds)
         ? body.serviceIds.map(String)
         : [],
-      // total canônico (aceita legado totalAmount)
+
       total: typeof body.total === "number" ? body.total
            : (typeof body.totalAmount === "number" ? body.totalAmount : 0),
+
+      weekKey: body.weekKey ?? null, // deixamos opcional (front pode enviar)
       notes: body.notes ?? "",
     };
 
-    // Só seta status se veio e normaliza para UPPERCASE; senão deixa o default do schema
     if (typeof body.status === "string" && body.status.trim()) {
       data.status = String(body.status).trim().toUpperCase();
     }
 
-    // Best-effort: preencher partnerName na criação
+    // Best-effort partnerName
     if (data.partnerId) {
       try {
-        const u = await UserModel.findById(String(data.partnerId), { fullName: 1, name: 1 }).lean();
-        data.partnerName = u?.fullName || "";
+        const u = await UserModel.findById(String(data.partnerId), { fullName: 1, login: 1 }).lean();
+        data.partnerName = u?.fullName || u?.login || "";
       } catch {}
+    }
+
+    // Se vier weekStart/End e não vier weekKey, setamos uma chave estável (YYYY-MM-DD→YYYY-MM-DD em UTC)
+    if (!data.weekKey && data.weekStart && data.weekEnd) {
+      const toISODate = (d: any) => {
+        const dd = new Date(d);
+        return isNaN(dd.getTime()) ? "" : dd.toISOString().slice(0, 10);
+        };
+      data.weekKey = `${toISODate(data.weekStart)}→${toISODate(data.weekEnd)}`;
     }
 
     const created = await PaymentModel.create(data);
@@ -333,14 +341,30 @@ router.patch(
     const id = String(req.params.id);
     const user = (req as any).user;
 
-    // parceiro só pode atualizar os seus
-    const guard = user?.role?.toLowerCase() === "partner" ? { _id: id, partnerId: String(user.id || user._id) } : { _id: id };
+    const guard = user?.role?.toLowerCase() === "partner"
+      ? { _id: id, partnerId: String(user.id || user._id) }
+      : { _id: id };
 
     const upd: AnyDoc = { ...req.body };
+
+    // Se vier strings para datas, Mongoose converte para Date
+    // (sem necessidade de pré-tratar aqui)
+
     if (upd.appendNote && upd.notes) {
-      const note = { id: new Date().getTime().toString(36), at: new Date().toISOString(), text: String(upd.notes) };
+      const note = { id: new Date().getTime().toString(36), at: new Date(), text: String(upd.notes) };
       delete upd.appendNote;
       upd.$push = { ...(upd.$push || {}), notesLog: note };
+    }
+
+    // Se weekStart/End foram atualizados e não há weekKey, geramos uma
+    if (!upd.weekKey && (upd.weekStart || upd.weekEnd)) {
+      const toISODate = (d: any) => {
+        const dd = new Date(d);
+        return isNaN(dd.getTime()) ? "" : dd.toISOString().slice(0, 10);
+      };
+      const ws = upd.weekStart ?? undefined;
+      const we = upd.weekEnd   ?? undefined;
+      if (ws && we) upd.weekKey = `${toISODate(ws)}→${toISODate(we)}`;
     }
 
     const row = await PaymentModel.findOneAndUpdate(guard, upd, { new: true, runValidators: false })
@@ -349,7 +373,7 @@ router.patch(
 
     if (!row) return res.status(404).json({ message: "Payment not found" });
     (row as AnyDoc).id = String(row._id);
-    // pós-update: garantir consistência nos campos exibidos pelo front (opcional, mas seguro)
+
     if (!(row as AnyDoc).partnerName) {
       (row as AnyDoc).partnerName = (row as AnyDoc).partner?.name || (row as AnyDoc).partner?.fullName || "";
     }
